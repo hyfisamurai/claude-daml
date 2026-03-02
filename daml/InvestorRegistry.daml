@@ -1,0 +1,6 @@
+-- | Accredited investor onboarding and Reg D 506(c) subscription management.
+-- Works in tandem with Compliance to gate all secondary market participation.
+module InvestorRegistry where
+
+import Types
+import Compliance

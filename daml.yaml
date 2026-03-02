@@ -1,0 +1,20 @@
+sdk-version: 2.9.0
+name: claude-daml
+version: 0.1.0
+source: daml
+
+dependencies:
+  - daml-prim
+  - daml-stdlib
+
+build-options:
+  - --ghc-option=-Werror   # Treat all warnings as errors
+
+# Module load order (bottom-up dependency hierarchy)
+# 1. Types          — shared types, no dependencies
+# 2. Compliance     — KYC/AML/Reg D whitelist, depends on Types
+# 3. CollateralRegistry — hard asset registry, depends on Types + Compliance
+# 4. LoanOrigination    — ABL loan lifecycle, depends on Collateral
+# 4. InvestorRegistry   — accredited investor onboarding, depends on Compliance
+# 5. LoanToken          — fractional token + yield, depends on Loan + Investor
+# 6. SecondaryMarket    — Reg D marketplace + DVP, depends on LoanToken

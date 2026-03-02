@@ -1,0 +1,7 @@
+-- | Asset-Based Lending (ABL) loan lifecycle.
+-- Covers loan application, lender commitment, funding, servicing, and repayment.
+module LoanOrigination where
+
+import Types
+import Compliance
+import CollateralRegistry

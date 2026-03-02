@@ -1,0 +1,8 @@
+-- | Fractional loan token issuance, transfer, yield accrual, and redemption.
+-- Compliance is enforced on every Transfer choice (KYC gate mirrors BENJI pattern).
+module LoanToken where
+
+import Types
+import Compliance
+import LoanOrigination
+import InvestorRegistry
