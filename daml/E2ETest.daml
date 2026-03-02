@@ -1,0 +1,327 @@
+-- | End-to-end integration test for the tokenized ABL system.
+--
+-- Exercises every module in dependency order, stitching together a single
+-- realistic deal lifecycle:
+--
+-- @
+--   Compliance (KYC + Reg D)
+--     → CollateralRegistry (registration + appraisal)
+--       → LoanOrigination (application → commitment → active loan + lien)
+--         → InvestorRegistry (onboarding + profiles)
+--           → LoanToken (tranche issuance + yield accrual + compliance hold)
+--             → SecondaryMarket (listing + atomic DVP settlement)
+--               → Servicing (partial payment + LTV check)
+--                 → Repayment (full repayment + lien release + token redemption)
+-- @
+--
+-- Scenario:
+--   • Lender funds a $1,400,000 ABL loan against a $2,100,000 warehouse (LTV ≈ 67%).
+--   • Loan is tokenized into 1,400,000 units × $1 face / 3% yield; all minted to Alice.
+--   • Lender receives a $400,000 quarterly payment (balance drops to $1,000,000).
+--   • Alice lists 700,000 tokens; lender matches with Bob via DVP.
+--   • Alice's 700,000-unit residual is frozen then unfrozen (compliance hold test).
+--   • Borrower repays the $1,000,000 balance; lien is released atomically.
+--   • Both Alice and Bob redeem their tokens; combined proceeds = $1,400,000.
+module E2ETest where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import DA.Optional (None, Some, fromSome)
+import Types
+import Compliance
+import CollateralRegistry
+import LoanOrigination
+import InvestorRegistry
+import LoanToken
+import SecondaryMarket
+
+-- ---------------------------------------------------------------------------
+-- Helper: approve KYC for a party
+-- ---------------------------------------------------------------------------
+
+approveKYCFor : Party -> Party -> Text -> Script (ContractId ParticipantKYC)
+approveKYCFor operator participant participantName = do
+  pendingCid <- submit operator do
+    createCmd ParticipantKYC with
+      operator        = operator
+      participant     = participant
+      participantName = participantName
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 5
+      jurisdiction    = "US"
+  submit operator do exerciseCmd pendingCid ApproveKYC
+
+-- ---------------------------------------------------------------------------
+-- E2E lifecycle test
+-- ---------------------------------------------------------------------------
+
+e2eLifecycleTest : Script ()
+e2eLifecycleTest = script do
+
+  -- =========================================================================
+  -- 0. Allocate parties
+  -- =========================================================================
+
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "Operator")
+  lender   <- allocatePartyWithHint "Lender"   (PartyIdHint "Lender")
+  borrower <- allocatePartyWithHint "Borrower" (PartyIdHint "Borrower")
+  alice    <- allocatePartyWithHint "Alice"    (PartyIdHint "Alice")   -- initial investor / seller
+  bob      <- allocatePartyWithHint "Bob"      (PartyIdHint "Bob")     -- secondary buyer
+
+  -- =========================================================================
+  -- 1. Compliance — KYC all parties
+  -- =========================================================================
+  -- Every downstream compliance gate fetches a ParticipantKYC on-chain.
+  -- Set up approved records for borrower, alice, and bob before they are needed.
+
+  borrowerKycCid <- approveKYCFor operator borrower "Acme Manufacturing LLC"
+  aliceKycCid    <- approveKYCFor operator alice    "Alice Capital Fund LP"
+  bobKycCid      <- approveKYCFor operator bob      "Bob Investments LLC"
+
+  -- =========================================================================
+  -- 2. Collateral registration
+  -- =========================================================================
+
+  -- Operator registers the pledged warehouse as an on-chain asset.
+  colCid <- submit operator do
+    createCmd CollateralAsset with
+      operator  = operator
+      lender    = lender
+      borrower  = borrower
+      assetInfo = CollateralInfo with
+        assetId        = "ASSET-RE-E2E-001"
+        assetType      = RealEstate
+        description    = "Industrial warehouse, 50,000 sq ft"
+        location       = "Chicago, IL"
+        appraisedValue = 2_000_000.0
+        appraisalDate  = date 2026 Jan 10
+      status = AssetRegistered
+      loanId = None
+
+  -- Operator records a certified appraisal update (value increases to $2.1M).
+  colCid <- submit operator do
+    exerciseCmd colCid UpdateAppraisal with
+      appraiser         = lender           -- lender-engaged certified appraiser
+      newAppraisedValue = 2_100_000.0
+      newAppraisalDate  = date 2026 Jan 15
+
+  -- =========================================================================
+  -- 3. Loan origination
+  -- =========================================================================
+  -- LTV = 1,400,000 / 2,100,000 ≈ 66.7% — within the 75% covenant ceiling.
+
+  -- Borrower submits the loan application.
+  appCid <- submit borrower do
+    createCmd LoanApplication with
+      operator          = operator
+      lender            = lender
+      borrower          = borrower
+      loanId            = "ABL-E2E-2026-001"
+      requestedAmount   = 1_400_000.0
+      collateralAssetId = "ASSET-RE-E2E-001"
+      submittedOn       = date 2026 Jan 20
+
+  -- Lender issues a term sheet.
+  commCid <- submit lender do
+    exerciseCmd appCid IssueCommitment with
+      terms = LoanTerms with
+        principal          = 1_400_000.0
+        annualInterestRate = 0.08
+        originationDate    = date 2026 Feb 1
+        maturityDate       = date 2027 Feb 1
+        paymentFrequency   = Monthly
+        maxLTV             = 0.75
+      issuedOn = date 2026 Jan 25
+
+  -- Borrower accepts: atomically perfects the lien and creates the ActiveLoan.
+  -- AcceptCommitment runs with lender+borrower authority (lender is LoanCommitment signatory).
+  (activeLoanCid, encColCid) <- submit borrower do
+    exerciseCmd commCid AcceptCommitment with
+      collateralCid = colCid
+      borrowerKycId = borrowerKycCid
+
+  -- =========================================================================
+  -- 4. Investor onboarding — Alice (initial token holder)
+  -- =========================================================================
+
+  aliceAccredCid <- submit operator do
+    createCmd InvestorAccreditation with
+      operator        = operator
+      investor        = alice
+      investorName    = "Alice Capital Fund LP"
+      tier            = Entity506c
+      attestationDate = date 2026 Jan 10
+      expiryDate      = date 2027 Jan 10
+
+  aliceReqCid <- submit alice do
+    createCmd OnboardingRequest with
+      operator     = operator
+      investor     = alice
+      investorName = "Alice Capital Fund LP"
+      tier         = Entity506c
+      requestedMax = 2_000_000.0
+      submittedOn  = date 2026 Jan 12
+
+  aliceProfileCid <- submit operator do
+    exerciseCmd aliceReqCid ApproveOnboarding with
+      accreditationCid = aliceAccredCid
+      approvedMax      = 2_000_000.0
+
+  -- =========================================================================
+  -- 5. Investor onboarding — Bob (secondary market buyer)
+  -- =========================================================================
+
+  bobAccredCid <- submit operator do
+    createCmd InvestorAccreditation with
+      operator        = operator
+      investor        = bob
+      investorName    = "Bob Investments LLC"
+      tier            = Individual506c
+      attestationDate = date 2026 Jan 11
+      expiryDate      = date 2027 Jan 11
+
+  bobReqCid <- submit bob do
+    createCmd OnboardingRequest with
+      operator     = operator
+      investor     = bob
+      investorName = "Bob Investments LLC"
+      tier         = Individual506c
+      requestedMax = 1_000_000.0
+      submittedOn  = date 2026 Jan 13
+
+  bobProfileCid <- submit operator do
+    exerciseCmd bobReqCid ApproveOnboarding with
+      accreditationCid = bobAccredCid
+      approvedMax      = 1_000_000.0
+
+  -- =========================================================================
+  -- 6. Token issuance — full 1,400,000-unit tranche to Alice
+  -- =========================================================================
+
+  let tranche = TokenTranche with
+        totalTokens    = 1_400_000.0   -- 1 unit = $1 face; matches loan principal
+        tokenFaceValue = 1.0
+        investorYield  = 0.03
+
+  -- Create the issuance record (audit trail for the initial placement).
+  issuanceCid <- submit lender do
+    createCmd TokenIssuance with
+      operator = operator
+      lender   = lender
+      loanId   = "ABL-E2E-2026-001"
+      tokenId  = "TKN-E2E-001"
+      tranche  = tranche
+      issuedOn = date 2026 Feb 1
+      loanCid  = activeLoanCid
+
+  -- Mint the entire tranche to Alice (single investor initial placement).
+  aliceTokenCid <- submit lender do
+    exerciseCmd issuanceCid MintAllocation with
+      investor          = alice
+      allocationAmount  = 1_400_000.0
+      receiverKycId     = aliceKycCid
+      receiverProfileId = aliceProfileCid
+
+  -- Close the issuance record — all allocations minted.
+  submit lender do exerciseCmd issuanceCid CloseIssuance
+
+  -- =========================================================================
+  -- 7. Yield accrual (nonconsuming — contract survives)
+  -- =========================================================================
+  -- 3% on $1,400,000 face value for 90 days ≈ $34,520 USD.
+
+  yieldAmount <- submit lender do
+    exerciseCmd aliceTokenCid AccrueYield with
+      fromDate = date 2026 Feb 1
+      toDate   = date 2026 May 2   -- 90 days
+
+  assertMsg "accrued yield should be positive" (yieldAmount > 0.0)
+
+  -- =========================================================================
+  -- 8. Loan servicing — partial payment
+  -- =========================================================================
+
+  -- Lender records a $400,000 quarterly payment.  Balance drops to $1,000,000.
+  activeLoanCid <- submit lender do
+    exerciseCmd activeLoanCid RecordPayment with
+      paymentAmount = 400_000.0
+
+  -- Verify LTV is still within covenant (1,000,000 / 2,100,000 ≈ 47.6% < 75%).
+  (currentLTV, withinCovenant) <- submit lender do
+    exerciseCmd activeLoanCid GetLTVStatus with
+      collateralCid = encColCid
+
+  assertMsg "LTV should be within covenant after partial payment" withinCovenant
+
+  -- =========================================================================
+  -- 9. Secondary market — Alice lists 700k; Bob buys via DVP
+  -- =========================================================================
+
+  -- Alice posts a listing for 700,000 of her 1,400,000 tokens at $0.95/unit.
+  listingCid <- submit alice do
+    createCmd TokenListing with
+      operator        = operator
+      lender          = lender
+      seller          = alice
+      tokenCid        = aliceTokenCid
+      tokenId         = "TKN-E2E-001"
+      loanId          = "ABL-E2E-2026-001"
+      listingAmount   = 700_000.0
+      askPricePerUnit = 0.95
+      listedOn        = date 2026 May 10
+      expiryDate      = date 2026 Dec 31
+      status          = ListingOpen
+
+  -- Lender matches the listing: compliance gate → Transfer → TradeRecord (atomic DVP).
+  (tradeCid, bobTokenCid, aliceResidualOpt) <- submit lender do
+    exerciseCmd listingCid MatchListing with
+      buyer          = bob
+      settlementDate = date 2026 May 15
+      buyerKycId     = bobKycCid
+      buyerProfileId = bobProfileCid
+
+  -- Alice retains a 700,000-unit residual from the partial sale.
+  assertMsg "alice should hold a residual token after partial sale"
+    (aliceResidualOpt /= None)
+  let aliceResidualCid = fromSome aliceResidualOpt
+
+  -- =========================================================================
+  -- 10. Compliance hold — freeze and unfreeze Alice's residual
+  -- =========================================================================
+
+  frozenCid        <- submit lender do exerciseCmd aliceResidualCid FreezeToken
+  aliceResidualCid <- submit lender do exerciseCmd frozenCid UnfreezeToken
+
+  -- =========================================================================
+  -- 11. Full loan repayment — lien released atomically
+  -- =========================================================================
+  -- Outstanding balance = $1,000,000 after the $400k payment.
+
+  _releasedColCid <- submit lender do
+    exerciseCmd activeLoanCid RecordFullRepayment with
+      finalPayment  = 1_000_000.0
+      collateralCid = encColCid
+
+  -- =========================================================================
+  -- 12. Token redemption
+  -- =========================================================================
+
+  -- Bob redeems his 700,000 units → pro-rata principal = $700,000.
+  bobProceeds <- submit lender do
+    exerciseCmd bobTokenCid RedeemToken with
+      redemptionDate = date 2026 Dec 15
+
+  assertMsg "bob's redemption proceeds should be positive" (bobProceeds > 0.0)
+
+  -- Alice redeems her residual 700,000 units → pro-rata principal = $700,000.
+  aliceProceeds <- submit lender do
+    exerciseCmd aliceResidualCid RedeemToken with
+      redemptionDate = date 2026 Dec 15
+
+  assertMsg "alice's redemption proceeds should be positive" (aliceProceeds > 0.0)
+
+  -- Combined proceeds must equal the full loan principal ($1,400,000).
+  assertMsg "combined alice + bob proceeds should equal full principal"
+    (bobProceeds + aliceProceeds == 1_400_000.0)
+
+  return ()
