@@ -136,6 +136,12 @@ data YieldStatus
   | YieldPaid     -- ^ Cash delivered off-chain; record kept for audit
   deriving (Eq, Ord, Show)
 
+-- | Lifecycle status of an LTV covenant breach alert.
+data CovenantAlertStatus
+  = AlertIssued        -- ^ Formal breach notice sent by lender
+  | AlertAcknowledged  -- ^ Borrower has confirmed receipt
+  deriving (Eq, Ord, Show)
+
 -- ---------------------------------------------------------------------------
 -- Reusable composite record types
 -- ---------------------------------------------------------------------------

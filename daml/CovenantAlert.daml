@@ -1,0 +1,109 @@
+-- | LTV covenant breach alert and cure workflow.
+--
+-- Completes the enforcement layer left open by @ActiveLoan.GetLTVStatus@.
+-- When a lender detects a breach (current LTV > covenantMaxLTV), they issue
+-- a @CovenantAlert@. The borrower has until @cureDeadline@ to restore the
+-- covenant — either by repaying principal or pledging additional collateral.
+-- The lender then either resolves the alert (breach cured) or escalates to
+-- formal default (calls @DeclareDefault@ on the @ActiveLoan@ separately).
+--
+-- Two-state lifecycle:
+--
+-- @
+--   CovenantAlert (AlertIssued)
+--       │ AcknowledgeAlert (borrower) — receipt confirmed
+--       │ ResolveAlert (lender)       — breach cured; archives
+--       │ EscalateToDefault (lender)  — proceeding to default; archives
+--       │ WithdrawAlert (lender)      — issued in error; archives
+--       ▼
+--   CovenantAlert (AlertAcknowledged)
+--       │ ResolveAlert (lender)       — breach cured; archives
+--       │ EscalateToDefault (lender)  — proceeding to default; archives
+-- @
+--
+-- Separation of concerns:
+-- * @CovenantAlert@ records the formal notice and cure period — it does NOT
+--   call @DeclareDefault@ directly. This keeps the module self-contained
+--   (depends only on @Types@) and lets the lender sequence the two actions
+--   explicitly, with a clean audit trail for each.
+--
+-- Dependency order: Types → CovenantAlert
+module CovenantAlert where
+
+import DA.Date (Date)
+import Types
+
+-- ---------------------------------------------------------------------------
+-- CovenantAlert
+-- ---------------------------------------------------------------------------
+
+-- | Formal on-ledger notice of an LTV covenant breach.
+--
+-- The lender issues this after detecting that the current loan-to-value
+-- ratio has exceeded the contracted ceiling. The borrower is an @observer@
+-- so they receive the notice automatically; they can acknowledge it to
+-- start the clock on their cure period.
+--
+-- Resolution paths:
+-- * Borrower repays principal / pledges additional collateral → lender calls @ResolveAlert@
+-- * Borrower fails to cure by @cureDeadline@ → lender calls @EscalateToDefault@,
+--   then @DeclareDefault@ on the @ActiveLoan@
+-- * Alert issued in error → lender calls @WithdrawAlert@
+template CovenantAlert
+  with
+    operator          : Operator
+    lender            : Lender
+    borrower          : Borrower
+    loanId            : LoanId    -- ^ Affected loan reference
+    collateralAssetId : AssetId   -- ^ Underlying collateral asset
+    alertDate         : Date      -- ^ Date the lender issued this notice
+    currentLTV        : Decimal   -- ^ Measured LTV at time of alert
+    covenantMaxLTV    : Decimal   -- ^ Contracted LTV ceiling (e.g., 0.75)
+    cureDeadline      : Date      -- ^ Borrower must restore covenant by this date
+    status            : CovenantAlertStatus
+  where
+    signatory lender
+    observer  operator, borrower
+
+    -- Alert must represent a genuine breach with a future cure deadline.
+    ensure currentLTV    > covenantMaxLTV &&
+           cureDeadline  > alertDate
+
+    -- | Borrower formally acknowledges receipt of the covenant breach notice.
+    --
+    -- Advances status to @AlertAcknowledged@. Does not waive any of the
+    -- lender's rights — it is a receipt confirmation only.
+    choice AcknowledgeAlert : ContractId CovenantAlert
+      controller borrower
+      do
+        assertMsg "AcknowledgeAlert: alert must be in Issued status"
+          (status == AlertIssued)
+        create this with status = AlertAcknowledged
+
+    -- | Lender confirms the breach has been cured and the covenant restored.
+    --
+    -- Archives this alert — the loan continues in good standing.
+    -- Valid in either @AlertIssued@ or @AlertAcknowledged@ status.
+    choice ResolveAlert : ()
+      controller lender
+      do return ()
+
+    -- | Lender formally escalates to default proceedings.
+    --
+    -- Archives this alert. The lender must then separately exercise
+    -- @DeclareDefault@ on the @ActiveLoan@ contract to liquidate collateral.
+    -- Keeping the steps separate preserves a clean audit trail for each action.
+    choice EscalateToDefault : ()
+      controller lender
+      do return ()
+
+    -- | Lender withdraws an alert issued in error (e.g., stale appraisal data).
+    --
+    -- Only permitted while the alert is still in @AlertIssued@ status.
+    -- Once the borrower has acknowledged, the lender must resolve or escalate.
+    choice WithdrawAlert : ()
+      controller lender
+      do
+        assertMsg "WithdrawAlert: can only withdraw an Issued alert (not Acknowledged)"
+          (status == AlertIssued)
+        return ()

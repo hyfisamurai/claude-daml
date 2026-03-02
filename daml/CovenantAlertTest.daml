@@ -1,0 +1,225 @@
+-- | Daml Script tests for the CovenantAlert module.
+-- Covers: full breach-notice lifecycle (Issued → Acknowledged → resolved/escalated),
+-- WithdrawAlert, authorization guards, state-transition guards, and ensure violations.
+module CovenantAlertTest where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import Types
+import CovenantAlert
+
+-- ---------------------------------------------------------------------------
+-- Test fixture
+-- ---------------------------------------------------------------------------
+
+data AlertFixture = AlertFixture
+  with
+    operator : Party
+    lender   : Party
+    borrower : Party
+    mallory  : Party   -- unauthorized party
+
+setupFixture : Script AlertFixture
+setupFixture = do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "Operator")
+  lender   <- allocatePartyWithHint "Lender"   (PartyIdHint "Lender")
+  borrower <- allocatePartyWithHint "Borrower" (PartyIdHint "Borrower")
+  mallory  <- allocatePartyWithHint "Mallory"  (PartyIdHint "Mallory")
+  return AlertFixture with ..
+
+-- | Standard covenant breach: LTV = 0.85 against 0.75 ceiling, 30-day cure window.
+mkAlert : AlertFixture -> Script (ContractId CovenantAlert)
+mkAlert f = submit f.lender do
+  createCmd CovenantAlert with
+    operator          = f.operator
+    lender            = f.lender
+    borrower          = f.borrower
+    loanId            = "ABL-2026-0001"
+    collateralAssetId = "ASSET-RE-001"
+    alertDate         = date 2026 Jun 1
+    currentLTV        = 0.85
+    covenantMaxLTV    = 0.75
+    cureDeadline      = date 2026 Jul 1   -- 30-day cure window
+    status            = AlertIssued
+
+-- ---------------------------------------------------------------------------
+-- Happy-path lifecycle
+-- ---------------------------------------------------------------------------
+
+-- | Lender issues a covenant breach alert — basic happy path.
+issueAlertTest : Script ()
+issueAlertTest = script do
+  f   <- setupFixture
+  cid <- mkAlert f
+  Some alert <- queryContractId f.lender cid
+  assertMsg "status should be AlertIssued" (alert.status == AlertIssued)
+  assertMsg "currentLTV should exceed covenant" (alert.currentLTV > alert.covenantMaxLTV)
+
+-- | Borrower acknowledges the alert — status advances to AlertAcknowledged.
+acknowledgeAlertTest : Script ()
+acknowledgeAlertTest = script do
+  f    <- setupFixture
+  cid  <- mkAlert f
+  ackCid <- submit f.borrower do exerciseCmd cid AcknowledgeAlert
+  Some alert <- queryContractId f.lender ackCid
+  assertMsg "status should be AlertAcknowledged" (alert.status == AlertAcknowledged)
+  -- Original Issued contract is consumed.
+  None <- queryContractId f.lender cid
+  return ()
+
+-- | Lender resolves a breach that was cured while still in Issued status.
+resolveIssuedAlertTest : Script ()
+resolveIssuedAlertTest = script do
+  f   <- setupFixture
+  cid <- mkAlert f
+  submit f.lender do exerciseCmd cid ResolveAlert
+  None <- queryContractId f.lender cid
+  return ()
+
+-- | Lender resolves a breach after the borrower acknowledged it.
+resolveAcknowledgedAlertTest : Script ()
+resolveAcknowledgedAlertTest = script do
+  f      <- setupFixture
+  cid    <- mkAlert f
+  ackCid <- submit f.borrower do exerciseCmd cid AcknowledgeAlert
+  submit f.lender do exerciseCmd ackCid ResolveAlert
+  None <- queryContractId f.lender ackCid
+  return ()
+
+-- | Lender escalates directly from Issued status — borrower has not cured.
+escalateFromIssuedTest : Script ()
+escalateFromIssuedTest = script do
+  f   <- setupFixture
+  cid <- mkAlert f
+  submit f.lender do exerciseCmd cid EscalateToDefault
+  -- Alert is archived; lender proceeds to DeclareDefault on ActiveLoan separately.
+  None <- queryContractId f.lender cid
+  return ()
+
+-- | Lender escalates after the borrower acknowledged but did not cure.
+escalateFromAcknowledgedTest : Script ()
+escalateFromAcknowledgedTest = script do
+  f      <- setupFixture
+  cid    <- mkAlert f
+  ackCid <- submit f.borrower do exerciseCmd cid AcknowledgeAlert
+  submit f.lender do exerciseCmd ackCid EscalateToDefault
+  None <- queryContractId f.lender ackCid
+  return ()
+
+-- | Lender withdraws an alert issued with stale appraisal data.
+withdrawIssuedAlertTest : Script ()
+withdrawIssuedAlertTest = script do
+  f   <- setupFixture
+  cid <- mkAlert f
+  submit f.lender do exerciseCmd cid WithdrawAlert
+  None <- queryContractId f.lender cid
+  return ()
+
+-- | Multiple alerts on different loans are independent.
+multiLoanAlertsTest : Script ()
+multiLoanAlertsTest = script do
+  f <- setupFixture
+  let mkForLoan loanId = submit f.lender do
+        createCmd CovenantAlert with
+          operator = f.operator; lender = f.lender; borrower = f.borrower
+          loanId = loanId; collateralAssetId = "ASSET-RE-001"
+          alertDate = date 2026 Jun 1; currentLTV = 0.82; covenantMaxLTV = 0.75
+          cureDeadline = date 2026 Jul 1; status = AlertIssued
+  cid1 <- mkForLoan "ABL-2026-0001"
+  cid2 <- mkForLoan "ABL-2026-0002"
+  -- Resolving one does not affect the other.
+  submit f.lender do exerciseCmd cid1 ResolveAlert
+  None <- queryContractId f.lender cid1
+  Some _ <- queryContractId f.lender cid2
+  return ()
+
+-- ---------------------------------------------------------------------------
+-- Authorization guards
+-- ---------------------------------------------------------------------------
+
+-- | Borrower cannot issue a CovenantAlert (lender controls creation).
+borrowerCannotIssueAlertTest : Script ()
+borrowerCannotIssueAlertTest = script do
+  f <- setupFixture
+  submitMustFail f.borrower do
+    createCmd CovenantAlert with
+      operator = f.operator; lender = f.lender; borrower = f.borrower
+      loanId = "ABL-2026-0001"; collateralAssetId = "ASSET-RE-001"
+      alertDate = date 2026 Jun 1; currentLTV = 0.85; covenantMaxLTV = 0.75
+      cureDeadline = date 2026 Jul 1; status = AlertIssued
+
+-- | Lender cannot acknowledge its own alert (borrower controls AcknowledgeAlert).
+lenderCannotAcknowledgeTest : Script ()
+lenderCannotAcknowledgeTest = script do
+  f   <- setupFixture
+  cid <- mkAlert f
+  submitMustFail f.lender do exerciseCmd cid AcknowledgeAlert
+
+-- | Borrower cannot resolve the alert (lender controls ResolveAlert).
+borrowerCannotResolveTest : Script ()
+borrowerCannotResolveTest = script do
+  f   <- setupFixture
+  cid <- mkAlert f
+  submitMustFail f.borrower do exerciseCmd cid ResolveAlert
+
+-- | Borrower cannot escalate to default (lender controls EscalateToDefault).
+borrowerCannotEscalateTest : Script ()
+borrowerCannotEscalateTest = script do
+  f   <- setupFixture
+  cid <- mkAlert f
+  submitMustFail f.borrower do exerciseCmd cid EscalateToDefault
+
+-- | Borrower cannot withdraw the alert (lender controls WithdrawAlert).
+borrowerCannotWithdrawTest : Script ()
+borrowerCannotWithdrawTest = script do
+  f   <- setupFixture
+  cid <- mkAlert f
+  submitMustFail f.borrower do exerciseCmd cid WithdrawAlert
+
+-- ---------------------------------------------------------------------------
+-- State-transition guards
+-- ---------------------------------------------------------------------------
+
+-- | WithdrawAlert on an Acknowledged alert must fail.
+withdrawAcknowledgedAlertTest : Script ()
+withdrawAcknowledgedAlertTest = script do
+  f      <- setupFixture
+  cid    <- mkAlert f
+  ackCid <- submit f.borrower do exerciseCmd cid AcknowledgeAlert
+  submitMustFail f.lender do exerciseCmd ackCid WithdrawAlert
+
+-- | AcknowledgeAlert on an already-Acknowledged alert must fail.
+acknowledgeAlertTwiceTest : Script ()
+acknowledgeAlertTwiceTest = script do
+  f      <- setupFixture
+  cid    <- mkAlert f
+  ackCid <- submit f.borrower do exerciseCmd cid AcknowledgeAlert
+  submitMustFail f.borrower do exerciseCmd ackCid AcknowledgeAlert
+
+-- ---------------------------------------------------------------------------
+-- Ensure violations
+-- ---------------------------------------------------------------------------
+
+-- | Creating an alert where currentLTV <= covenantMaxLTV must fail (no genuine breach).
+ensureNoBreachTest : Script ()
+ensureNoBreachTest = script do
+  f <- setupFixture
+  -- LTV = 0.70 is within the 0.75 covenant ceiling — not a breach.
+  submitMustFail f.lender do
+    createCmd CovenantAlert with
+      operator = f.operator; lender = f.lender; borrower = f.borrower
+      loanId = "ABL"; collateralAssetId = "ASSET"
+      alertDate = date 2026 Jun 1; currentLTV = 0.70; covenantMaxLTV = 0.75
+      cureDeadline = date 2026 Jul 1; status = AlertIssued
+
+-- | Creating an alert where cureDeadline <= alertDate must fail.
+ensureInvalidCureDeadlineTest : Script ()
+ensureInvalidCureDeadlineTest = script do
+  f <- setupFixture
+  submitMustFail f.lender do
+    createCmd CovenantAlert with
+      operator = f.operator; lender = f.lender; borrower = f.borrower
+      loanId = "ABL"; collateralAssetId = "ASSET"
+      alertDate = date 2026 Jun 1; currentLTV = 0.85; covenantMaxLTV = 0.75
+      cureDeadline = date 2026 Jun 1   -- same day — not a future deadline
+      status = AlertIssued
