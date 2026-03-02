@@ -1,7 +1,152 @@
 -- | Hard asset collateral registration and lien management.
+--
 -- Records pledged assets (real estate, equipment, fleet, etc.),
 -- third-party appraisals, LTV calculations, and lender lien perfection.
+--
+-- The operator acts as the on-chain title registry (analogous to a county
+-- recorder). The lender controls lien lifecycle choices. The borrower is
+-- an observer — they can see the record but cannot alter it.
+--
+-- Dependency order: Types → Compliance → CollateralRegistry
 module CollateralRegistry where
 
+import DA.Date (Date)
+import DA.Optional (isNone)
 import Types
 import Compliance
+
+-- ---------------------------------------------------------------------------
+-- CollateralAsset
+-- ---------------------------------------------------------------------------
+
+-- | On-ledger record of a hard asset pledged as ABL collateral.
+--
+-- Lifecycle:
+--
+-- @
+--   AssetRegistered
+--       │ PerfectLien (lender)
+--       ▼
+--   AssetEncumbered
+--       │ ReleaseLien (lender)       │ LiquidateAsset (lender)
+--       ▼                            ▼
+--   AssetReleased               AssetLiquidated
+-- @
+--
+-- Appraisals can be updated in either @AssetRegistered@ or @AssetEncumbered@
+-- state, allowing periodic re-valuations during the loan term.
+template CollateralAsset
+  with
+    operator  : Operator        -- ^ Registry authority; sole signatory
+    lender    : Lender          -- ^ Holds and may exercise the lien
+    borrower  : Borrower        -- ^ Owner of the pledged asset; observer
+    assetInfo : CollateralInfo  -- ^ Immutable snapshot; updated via UpdateAppraisal
+    status    : AssetStatus     -- ^ Current lien/registry state
+    loanId    : Optional LoanId -- ^ Set on PerfectLien; cleared on ReleaseLien
+  where
+    signatory operator
+    observer  lender, borrower
+
+    -- Appraisal value must always be positive.
+    ensure assetInfo.appraisedValue > 0.0
+
+    -- Released or liquidated assets carry no active loan reference.
+    ensure (status == AssetReleased || status == AssetLiquidated) ==>
+           isNone loanId
+
+    -- ---------------------------------------------------------------------------
+    -- Appraisal management
+    -- ---------------------------------------------------------------------------
+
+    -- | Record an updated third-party appraisal.
+    --
+    -- Only valid while the asset is registered or actively encumbered.
+    -- Liquidated and released assets do not need re-appraisal.
+    -- The operator certifies the appraiser's valuation before recording it.
+    choice UpdateAppraisal : ContractId CollateralAsset
+      with
+        appraiser         : Appraiser  -- ^ Certified party that performed the valuation
+        newAppraisedValue : Decimal    -- ^ USD fair-market value
+        newAppraisalDate  : Date       -- ^ Date the appraisal was conducted
+      controller operator
+      do
+        assertMsg "UpdateAppraisal: asset must be Registered or Encumbered"
+          (status == AssetRegistered || status == AssetEncumbered)
+        assertMsg "UpdateAppraisal: appraised value must be positive"
+          (newAppraisedValue > 0.0)
+        create this with
+          assetInfo = assetInfo with
+            appraisedValue = newAppraisedValue
+            appraisalDate  = newAppraisalDate
+
+    -- ---------------------------------------------------------------------------
+    -- Lien lifecycle
+    -- ---------------------------------------------------------------------------
+
+    -- | Perfect a first-priority lien against this asset for a given loan.
+    --
+    -- Transitions: AssetRegistered → AssetEncumbered.
+    -- Requires KYC-approved borrower (borrower's ParticipantKYC passed for on-chain
+    -- verification) to confirm the pledging party is cleared.
+    choice PerfectLien : ContractId CollateralAsset
+      with
+        forLoanId     : LoanId
+        borrowerKycId : ContractId ParticipantKYC  -- ^ Borrower's current KYC record
+      controller lender
+      do
+        assertMsg "PerfectLien: asset must be in AssetRegistered state"
+          (status == AssetRegistered)
+        -- Verify borrower is KYC-approved before perfecting the lien.
+        kycRecord <- fetch borrowerKycId
+        assertMsg "PerfectLien: borrower KYC must be for this borrower"
+          (kycRecord.participant == borrower)
+        assertMsg "PerfectLien: borrower must be KYCApproved"
+          (kycRecord.kycStatus == KYCApproved)
+        create this with
+          status = AssetEncumbered
+          loanId = Some forLoanId
+
+    -- | Release the lien after the borrower fully repays the loan.
+    --
+    -- Transitions: AssetEncumbered → AssetReleased.
+    -- Called by the LoanOrigination module when it records full repayment.
+    choice ReleaseLien : ContractId CollateralAsset
+      controller lender
+      do
+        assertMsg "ReleaseLien: asset must be in AssetEncumbered state"
+          (status == AssetEncumbered)
+        create this with
+          status = AssetReleased
+          loanId = None
+
+    -- | Liquidate the collateral after a borrower default.
+    --
+    -- Transitions: AssetEncumbered → AssetLiquidated.
+    -- The lender sells the asset off-ledger; this records the on-chain outcome.
+    choice LiquidateAsset : ContractId CollateralAsset
+      with
+        liquidationProceeds : Decimal  -- ^ USD recovered from the sale
+      controller lender
+      do
+        assertMsg "LiquidateAsset: asset must be in AssetEncumbered state"
+          (status == AssetEncumbered)
+        assertMsg "LiquidateAsset: liquidation proceeds must be non-negative"
+          (liquidationProceeds >= 0.0)
+        create this with
+          status = AssetLiquidated
+          loanId = None
+
+    -- ---------------------------------------------------------------------------
+    -- Query (nonconsuming)
+    -- ---------------------------------------------------------------------------
+
+    -- | Compute the current loan-to-value ratio.
+    --
+    -- Delegates to the pure @computeLTV@ function from Types.
+    -- Returns 1.0 (100% LTV) if the appraisedValue has somehow become zero.
+    nonconsuming choice GetCurrentLTV : Decimal
+      with
+        outstandingBalance : Decimal  -- ^ Current unpaid principal in USD
+      controller lender
+      do
+        return (computeLTV outstandingBalance assetInfo.appraisedValue)
