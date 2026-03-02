@@ -1,0 +1,316 @@
+-- | Daml Script tests for the Compliance module.
+-- Covers: KYC lifecycle, accreditation lifecycle, authorization guards,
+-- state-transition guards, and ensure preconditions.
+module ComplianceTest where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import Compliance
+import Types
+
+-- ---------------------------------------------------------------------------
+-- Helper
+-- ---------------------------------------------------------------------------
+
+-- | Allocate the standard three-party compliance test fixture.
+data ComplianceFixture = ComplianceFixture
+  with
+    operator : Party
+    alice    : Party   -- generic participant / borrower
+    bob      : Party   -- generic investor
+    mallory  : Party   -- unauthorized third party
+
+setupFixture : Script ComplianceFixture
+setupFixture = do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "Operator")
+  alice    <- allocatePartyWithHint "Alice"    (PartyIdHint "Alice")
+  bob      <- allocatePartyWithHint "Bob"      (PartyIdHint "Bob")
+  mallory  <- allocatePartyWithHint "Mallory"  (PartyIdHint "Mallory")
+  return ComplianceFixture with ..
+
+-- ---------------------------------------------------------------------------
+-- KYC lifecycle tests
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: Pending → Approved → Suspended → Reinstated → Revoked.
+kycFullLifecycleTest : Script ()
+kycFullLifecycleTest = script do
+  f <- setupFixture
+
+  -- Operator creates a pending KYC record for Alice.
+  pendingCid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.alice
+      participantName = "Alice Borrower LLC"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 15
+      jurisdiction    = "US"
+
+  -- Operator approves.
+  approvedCid <- submit f.operator do
+    exerciseCmd pendingCid ApproveKYC
+
+  -- Operator suspends for a compliance review.
+  suspendedCid <- submit f.operator do
+    exerciseCmd approvedCid SuspendKYC
+
+  -- Review clears — operator reinstates.
+  reinstatedCid <- submit f.operator do
+    exerciseCmd suspendedCid ReinstatKYC
+
+  -- Final revocation (archives the contract).
+  submit f.operator do
+    exerciseCmd reinstatedCid RevokeKYC
+
+-- | Happy path: Operator directly approves then revokes (short path).
+kycApproveRevokeTest : Script ()
+kycApproveRevokeTest = script do
+  f <- setupFixture
+
+  cid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.alice
+      participantName = "Alice Borrower LLC"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Mar 1
+      jurisdiction    = "US"
+
+  approvedCid <- submit f.operator do exerciseCmd cid ApproveKYC
+
+  submit f.operator do exerciseCmd approvedCid RevokeKYC
+
+-- ---------------------------------------------------------------------------
+-- KYC authorization tests
+-- ---------------------------------------------------------------------------
+
+-- | Unauthorized party cannot approve a KYC application.
+unauthorizedApproveTest : Script ()
+unauthorizedApproveTest = script do
+  f <- setupFixture
+
+  cid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.alice
+      participantName = "Alice Borrower LLC"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 15
+      jurisdiction    = "US"
+
+  -- Mallory is not the operator; must fail.
+  submitMustFail f.mallory do exerciseCmd cid ApproveKYC
+
+-- | The participant cannot approve their own KYC.
+selfApproveTest : Script ()
+selfApproveTest = script do
+  f <- setupFixture
+
+  cid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.alice
+      participantName = "Alice Borrower LLC"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 15
+      jurisdiction    = "US"
+
+  submitMustFail f.alice do exerciseCmd cid ApproveKYC
+
+-- ---------------------------------------------------------------------------
+-- KYC state-guard tests
+-- ---------------------------------------------------------------------------
+
+-- | Cannot approve a contract that is already KYCApproved.
+doubleApproveTest : Script ()
+doubleApproveTest = script do
+  f <- setupFixture
+
+  cid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.alice
+      participantName = "Alice Borrower LLC"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 15
+      jurisdiction    = "US"
+
+  approvedCid <- submit f.operator do exerciseCmd cid ApproveKYC
+
+  -- ApproveKYC asserts kycStatus == KYCPending; this is KYCApproved.
+  submitMustFail f.operator do exerciseCmd approvedCid ApproveKYC
+
+-- | Cannot suspend a participant that is already KYCSuspended.
+doubleSuspendTest : Script ()
+doubleSuspendTest = script do
+  f <- setupFixture
+
+  cid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.alice
+      participantName = "Alice Borrower LLC"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 15
+      jurisdiction    = "US"
+
+  approvedCid  <- submit f.operator do exerciseCmd cid ApproveKYC
+  suspendedCid <- submit f.operator do exerciseCmd approvedCid SuspendKYC
+
+  -- SuspendKYC asserts kycStatus == KYCApproved; this is KYCSuspended.
+  submitMustFail f.operator do exerciseCmd suspendedCid SuspendKYC
+
+-- | Cannot reinstate a participant that is KYCApproved (not suspended).
+reinstateApprovedTest : Script ()
+reinstateApprovedTest = script do
+  f <- setupFixture
+
+  cid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.alice
+      participantName = "Alice Borrower LLC"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 15
+      jurisdiction    = "US"
+
+  approvedCid <- submit f.operator do exerciseCmd cid ApproveKYC
+
+  -- ReinstatKYC asserts kycStatus == KYCSuspended; this is KYCApproved.
+  submitMustFail f.operator do exerciseCmd approvedCid ReinstatKYC
+
+-- | ensure clause: cannot create a KYC record with KYCRevoked status directly.
+createRevokedKYCTest : Script ()
+createRevokedKYCTest = script do
+  f <- setupFixture
+
+  -- KYCRevoked violates the ensure clause on ParticipantKYC.
+  submitMustFail f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.alice
+      participantName = "Alice Borrower LLC"
+      kycStatus       = KYCRevoked
+      submittedOn     = date 2026 Jan 15
+      jurisdiction    = "US"
+
+-- ---------------------------------------------------------------------------
+-- InvestorAccreditation lifecycle tests
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: issue accreditation, renew for another year, then revoke.
+accreditationLifecycleTest : Script ()
+accreditationLifecycleTest = script do
+  f <- setupFixture
+
+  accredCid <- submit f.operator do
+    createCmd InvestorAccreditation with
+      operator        = f.operator
+      investor        = f.bob
+      investorName    = "Bob Capital Partners LLC"
+      tier            = Entity506c
+      attestationDate = date 2026 Jan 1
+      expiryDate      = date 2027 Jan 1
+
+  -- Annual renewal — attestation window advances to old expiry.
+  renewedCid <- submit f.operator do
+    exerciseCmd accredCid RenewAccreditation with
+      newExpiryDate = date 2028 Jan 1
+
+  -- Revoke (archives contract).
+  submit f.operator do exerciseCmd renewedCid RevokeAccreditation
+
+-- | All three accreditation tiers can be created successfully.
+allAccreditationTiersTest : Script ()
+allAccreditationTiersTest = script do
+  f <- setupFixture
+
+  let mkAccred inv tier = submit f.operator do
+        createCmd InvestorAccreditation with
+          operator        = f.operator
+          investor        = inv
+          investorName    = "Investor"
+          tier            = tier
+          attestationDate = date 2026 Jan 1
+          expiryDate      = date 2027 Jan 1
+
+  _ <- mkAccred f.alice Individual506c
+  _ <- mkAccred f.bob   Entity506c
+  _ <- mkAccred f.mallory QualifiedPurchaser
+  return ()
+
+-- ---------------------------------------------------------------------------
+-- InvestorAccreditation authorization tests
+-- ---------------------------------------------------------------------------
+
+-- | Unauthorized party cannot revoke accreditation.
+unauthorizedRevokeAccreditationTest : Script ()
+unauthorizedRevokeAccreditationTest = script do
+  f <- setupFixture
+
+  accredCid <- submit f.operator do
+    createCmd InvestorAccreditation with
+      operator        = f.operator
+      investor        = f.bob
+      investorName    = "Bob Capital Partners LLC"
+      tier            = Individual506c
+      attestationDate = date 2026 Jan 1
+      expiryDate      = date 2027 Jan 1
+
+  -- Mallory has no authority over this contract.
+  submitMustFail f.mallory do exerciseCmd accredCid RevokeAccreditation
+
+  -- Investor themselves cannot revoke their own accreditation.
+  submitMustFail f.bob do exerciseCmd accredCid RevokeAccreditation
+
+-- ---------------------------------------------------------------------------
+-- InvestorAccreditation ensure / guard tests
+-- ---------------------------------------------------------------------------
+
+-- | ensure: expiry must be strictly after attestation (same date fails).
+sameDateAccreditationTest : Script ()
+sameDateAccreditationTest = script do
+  f <- setupFixture
+
+  submitMustFail f.operator do
+    createCmd InvestorAccreditation with
+      operator        = f.operator
+      investor        = f.bob
+      investorName    = "Bob Capital Partners LLC"
+      tier            = Individual506c
+      attestationDate = date 2026 Jun 1
+      expiryDate      = date 2026 Jun 1  -- same date: ensure violation
+
+-- | ensure: expiry before attestation fails.
+expiryBeforeAttestationTest : Script ()
+expiryBeforeAttestationTest = script do
+  f <- setupFixture
+
+  submitMustFail f.operator do
+    createCmd InvestorAccreditation with
+      operator        = f.operator
+      investor        = f.bob
+      investorName    = "Bob Capital Partners LLC"
+      tier            = Entity506c
+      attestationDate = date 2026 Jun 1
+      expiryDate      = date 2025 Dec 31  -- before attestation: ensure violation
+
+-- | Renewal must be strictly after the current expiry date.
+renewToEarlierDateTest : Script ()
+renewToEarlierDateTest = script do
+  f <- setupFixture
+
+  accredCid <- submit f.operator do
+    createCmd InvestorAccreditation with
+      operator        = f.operator
+      investor        = f.bob
+      investorName    = "Bob Capital Partners LLC"
+      tier            = Individual506c
+      attestationDate = date 2026 Jan 1
+      expiryDate      = date 2027 Jan 1
+
+  -- Cannot renew to a date that is not after the current expiry.
+  submitMustFail f.operator do
+    exerciseCmd accredCid RenewAccreditation with
+      newExpiryDate = date 2026 Dec 31  -- before current 2027-01-01 expiry

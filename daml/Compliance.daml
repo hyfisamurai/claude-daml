@@ -1,6 +1,130 @@
--- | Cross-cutting KYC/AML compliance layer.
--- Maintains the canonical whitelist of cleared parties and Reg D accreditation status.
--- Every transfer choice in every other module must verify membership here.
+-- | KYC/AML whitelist and Reg D 506(c) accreditation module.
+--
+-- This module is the compliance gateway for the entire platform.
+-- Every module that lets a party take a privileged action should
+-- require a @ContractId ParticipantKYC@ (status == KYCApproved)
+-- and, for investor-facing actions, a @ContractId InvestorAccreditation@.
+--
+-- Dependency order: Types → Compliance ← everything else
 module Compliance where
 
+import DA.Date (Date)
 import Types
+
+-- ---------------------------------------------------------------------------
+-- ParticipantKYC
+-- ---------------------------------------------------------------------------
+
+-- | On-ledger record of a participant's KYC/AML clearance.
+--
+-- Created by the operator when a participant completes off-chain ID verification.
+-- Lifecycle:
+--
+-- @
+--   KYCPending
+--       │ ApproveKYC
+--       ▼
+--   KYCApproved ◄──────── ReinstatKYC ─── KYCSuspended
+--       │                                      ▲
+--       └──────────── SuspendKYC ──────────────┘
+--
+--   Any state → RevokeKYC → (contract archived; ledger preserves history)
+-- @
+template ParticipantKYC
+  with
+    operator        : Operator  -- ^ System administrator; sole signatory
+    participant     : Party     -- ^ The entity being KYC-verified
+    participantName : Text      -- ^ Legal name of the participant
+    kycStatus       : KYCStatus -- ^ Current clearance status
+    submittedOn     : Date      -- ^ Date the KYC application was submitted
+    jurisdiction    : Text      -- ^ ISO 3166-1 alpha-2 domicile, e.g. "US"
+  where
+    signatory operator
+    observer  participant
+
+    -- Revocation is modeled as archiving (see RevokeKYC).
+    -- Prevent manual creation of an already-revoked record.
+    ensure kycStatus /= KYCRevoked
+
+    -- | Approve a pending KYC application.
+    -- Transitions: KYCPending → KYCApproved.
+    choice ApproveKYC : ContractId ParticipantKYC
+      controller operator
+      do
+        assertMsg "ApproveKYC: participant must be in KYCPending state"
+          (kycStatus == KYCPending)
+        create this with kycStatus = KYCApproved
+
+    -- | Suspend an approved participant (e.g., suspicious activity flag).
+    -- Transitions: KYCApproved → KYCSuspended.
+    -- A suspended participant cannot act on the platform until reinstated.
+    choice SuspendKYC : ContractId ParticipantKYC
+      controller operator
+      do
+        assertMsg "SuspendKYC: participant must be KYCApproved"
+          (kycStatus == KYCApproved)
+        create this with kycStatus = KYCSuspended
+
+    -- | Reinstate a suspended participant after the compliance review clears.
+    -- Transitions: KYCSuspended → KYCApproved.
+    choice ReinstatKYC : ContractId ParticipantKYC
+      controller operator
+      do
+        assertMsg "ReinstatKYC: participant must be KYCSuspended"
+          (kycStatus == KYCSuspended)
+        create this with kycStatus = KYCApproved
+
+    -- | Permanently revoke a participant's KYC clearance.
+    -- Archives the contract; the Daml ledger preserves the full
+    -- transaction history for audit purposes.
+    -- A revoked participant must re-apply from scratch (new contract).
+    choice RevokeKYC : ()
+      controller operator
+      do return ()
+
+-- ---------------------------------------------------------------------------
+-- InvestorAccreditation
+-- ---------------------------------------------------------------------------
+
+-- | Reg D 506(c) accreditation attestation for a token investor.
+--
+-- Required in addition to @ParticipantKYC@ for any investor who wishes
+-- to purchase or hold fractional loan tokens on the secondary market.
+--
+-- The operator issues this contract after verifying the investor's
+-- accreditation tier off-chain (income/net-worth statements, CPA letter, etc.).
+-- Accreditation must be renewed annually (Reg D best practice).
+template InvestorAccreditation
+  with
+    operator        : Operator           -- ^ System administrator; sole signatory
+    investor        : Investor           -- ^ The accredited investor
+    investorName    : Text               -- ^ Legal name of the investor entity
+    tier            : AccreditationTier  -- ^ Reg D 506(c) classification
+    attestationDate : Date               -- ^ Date the attestation was verified
+    expiryDate      : Date               -- ^ Accreditation expiry (annual renewal)
+  where
+    signatory operator
+    observer  investor
+
+    -- Expiry must be strictly after attestation; same-day is not valid.
+    ensure expiryDate > attestationDate
+
+    -- | Extend accreditation expiry after annual re-verification.
+    -- The new expiry must be strictly after the current expiry.
+    choice RenewAccreditation : ContractId InvestorAccreditation
+      with
+        newExpiryDate : Date
+      controller operator
+      do
+        assertMsg "RenewAccreditation: new expiry must be after current expiry"
+          (newExpiryDate > expiryDate)
+        create this with
+          attestationDate = expiryDate  -- renewal window opens where old one ended
+          expiryDate      = newExpiryDate
+
+    -- | Revoke accreditation — archives the contract.
+    -- Investor loses the right to purchase new tokens.
+    -- Existing token holdings are governed by TokenStatus (see LoanToken module).
+    choice RevokeAccreditation : ()
+      controller operator
+      do return ()
