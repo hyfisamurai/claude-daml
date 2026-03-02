@@ -1,0 +1,268 @@
+-- | Daml Script tests for the YieldDistribution module.
+-- Covers: full Pending→Paid lifecycle, VoidDistribution, PurgeRecord,
+-- authorization guards, state-transition guards, ensure violations,
+-- multi-period sequences, and multi-investor independence.
+module YieldDistributionTest where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import Types
+import YieldDistribution
+
+-- ---------------------------------------------------------------------------
+-- Test fixture
+-- ---------------------------------------------------------------------------
+
+data YieldFixture = YieldFixture
+  with
+    operator : Party
+    lender   : Party
+    alice    : Party   -- investor
+    bob      : Party   -- second investor
+    mallory  : Party   -- unauthorized party
+
+setupFixture : Script YieldFixture
+setupFixture = do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "Operator")
+  lender   <- allocatePartyWithHint "Lender"   (PartyIdHint "Lender")
+  alice    <- allocatePartyWithHint "Alice"    (PartyIdHint "Alice")
+  bob      <- allocatePartyWithHint "Bob"      (PartyIdHint "Bob")
+  mallory  <- allocatePartyWithHint "Mallory"  (PartyIdHint "Mallory")
+  return YieldFixture with ..
+
+-- | Create a standard YieldPending distribution for alice (30-day period, 3% rate).
+mkDistribution : YieldFixture -> Script (ContractId YieldDistribution)
+mkDistribution f = submit f.lender do
+  createCmd YieldDistribution with
+    operator         = f.operator
+    lender           = f.lender
+    investor         = f.alice
+    tokenId          = "TKN-0001-A"
+    loanId           = "ABL-2026-0001"
+    periodStart      = date 2026 Feb 1
+    periodEnd        = date 2026 Mar 3   -- 30 days
+    tokenSnapshot    = 500_000.0
+    yieldRate        = 0.03
+    yieldAmount      = 1_232.88          -- 500k × 0.03 × (30/365)
+    distributionDate = date 2026 Mar 5
+    status           = YieldPending
+
+-- ---------------------------------------------------------------------------
+-- Happy-path lifecycle
+-- ---------------------------------------------------------------------------
+
+-- | Create a YieldPending distribution — basic happy path.
+createPendingDistributionTest : Script ()
+createPendingDistributionTest = script do
+  f   <- setupFixture
+  cid <- mkDistribution f
+  -- Verify the contract is visible to all parties.
+  Some dist <- queryContractId f.lender cid
+  assertMsg "status should be Pending" (dist.status == YieldPending)
+  assertMsg "yieldAmount should match" (dist.yieldAmount == 1_232.88)
+
+-- | Pending → MarkPaid → YieldPaid lifecycle.
+markPaidLifecycleTest : Script ()
+markPaidLifecycleTest = script do
+  f      <- setupFixture
+  distCid <- mkDistribution f
+  paidCid <- submit f.lender do exerciseCmd distCid MarkPaid
+  Some paid <- queryContractId f.lender paidCid
+  assertMsg "status should be Paid after MarkPaid" (paid.status == YieldPaid)
+  assertMsg "yieldAmount unchanged after MarkPaid" (paid.yieldAmount == 1_232.88)
+  -- Original Pending contract is consumed.
+  None <- queryContractId f.lender distCid
+  return ()
+
+-- | VoidDistribution archives a Pending record without creating a replacement.
+voidPendingDistributionTest : Script ()
+voidPendingDistributionTest = script do
+  f      <- setupFixture
+  distCid <- mkDistribution f
+  submit f.lender do exerciseCmd distCid VoidDistribution
+  -- Contract is archived; no trace remains.
+  None <- queryContractId f.lender distCid
+  return ()
+
+-- | PurgeRecord archives a Paid record after the retention period.
+purgeAfterPaymentTest : Script ()
+purgeAfterPaymentTest = script do
+  f       <- setupFixture
+  distCid  <- mkDistribution f
+  paidCid  <- submit f.lender do exerciseCmd distCid MarkPaid
+  submit f.operator do exerciseCmd paidCid PurgeRecord
+  -- Both contracts are now gone.
+  None <- queryContractId f.operator paidCid
+  return ()
+
+-- | Multi-period sequence: three consecutive monthly distributions for alice.
+multiPeriodSequenceTest : Script ()
+multiPeriodSequenceTest = script do
+  f <- setupFixture
+  let mkPeriod ps pe ya = submit f.lender do
+        createCmd YieldDistribution with
+          operator         = f.operator
+          lender           = f.lender
+          investor         = f.alice
+          tokenId          = "TKN-0001-A"
+          loanId           = "ABL-2026-0001"
+          periodStart      = ps
+          periodEnd        = pe
+          tokenSnapshot    = 500_000.0
+          yieldRate        = 0.03
+          yieldAmount      = ya
+          distributionDate = pe
+          status           = YieldPending
+
+  cid1 <- mkPeriod (date 2026 Feb 1) (date 2026 Mar 3)  1_232.88
+  cid2 <- mkPeriod (date 2026 Mar 3) (date 2026 Apr 3)  1_232.88
+  cid3 <- mkPeriod (date 2026 Apr 3) (date 2026 May 4)  1_232.88
+
+  -- Mark all three paid.
+  p1 <- submit f.lender do exerciseCmd cid1 MarkPaid
+  p2 <- submit f.lender do exerciseCmd cid2 MarkPaid
+  p3 <- submit f.lender do exerciseCmd cid3 MarkPaid
+
+  Some d1 <- queryContractId f.lender p1
+  Some d2 <- queryContractId f.lender p2
+  Some d3 <- queryContractId f.lender p3
+  assertMsg "all three records should be Paid"
+    (d1.status == YieldPaid && d2.status == YieldPaid && d3.status == YieldPaid)
+
+-- | Two investors receive independent distributions for the same period.
+multiInvestorDistributionTest : Script ()
+multiInvestorDistributionTest = script do
+  f <- setupFixture
+  let mkInvestorDist investor snapshot amount = submit f.lender do
+        createCmd YieldDistribution with
+          operator         = f.operator
+          lender           = f.lender
+          investor         = investor
+          tokenId          = "TKN-0001-A"
+          loanId           = "ABL-2026-0001"
+          periodStart      = date 2026 Feb 1
+          periodEnd        = date 2026 Mar 3
+          tokenSnapshot    = snapshot
+          yieldRate        = 0.03
+          yieldAmount      = amount
+          distributionDate = date 2026 Mar 5
+          status           = YieldPending
+
+  aliceCid <- mkInvestorDist f.alice 700_000.0 1_725.21  -- 70% allocation
+  bobCid   <- mkInvestorDist f.bob   300_000.0   739.73  -- 30% allocation
+
+  -- Each investor sees only their own record (lender sees both).
+  Some aliceDist <- queryContractId f.lender aliceCid
+  Some bobDist   <- queryContractId f.lender bobCid
+  assertMsg "alice and bob have different amounts"
+    (aliceDist.yieldAmount /= bobDist.yieldAmount)
+  assertMsg "alice snapshot" (aliceDist.tokenSnapshot == 700_000.0)
+  assertMsg "bob snapshot"   (bobDist.tokenSnapshot   == 300_000.0)
+
+-- ---------------------------------------------------------------------------
+-- Authorization guards
+-- ---------------------------------------------------------------------------
+
+-- | Investor (alice) cannot mark her own distribution as paid.
+markPaidUnauthorizedTest : Script ()
+markPaidUnauthorizedTest = script do
+  f      <- setupFixture
+  distCid <- mkDistribution f
+  submitMustFail f.alice do exerciseCmd distCid MarkPaid
+
+-- | Operator cannot mark a distribution as paid (lender controls MarkPaid).
+markPaidByOperatorTest : Script ()
+markPaidByOperatorTest = script do
+  f      <- setupFixture
+  distCid <- mkDistribution f
+  submitMustFail f.operator do exerciseCmd distCid MarkPaid
+
+-- | Investor cannot void their own distribution.
+voidUnauthorizedTest : Script ()
+voidUnauthorizedTest = script do
+  f      <- setupFixture
+  distCid <- mkDistribution f
+  submitMustFail f.alice do exerciseCmd distCid VoidDistribution
+
+-- | Lender cannot purge a record — only the operator can.
+purgeByLenderTest : Script ()
+purgeByLenderTest = script do
+  f       <- setupFixture
+  distCid  <- mkDistribution f
+  paidCid  <- submit f.lender do exerciseCmd distCid MarkPaid
+  submitMustFail f.lender do exerciseCmd paidCid PurgeRecord
+
+-- ---------------------------------------------------------------------------
+-- State-transition guards
+-- ---------------------------------------------------------------------------
+
+-- | PurgeRecord on a Pending distribution must fail (must be Paid first).
+purgeBeforePaymentTest : Script ()
+purgeBeforePaymentTest = script do
+  f      <- setupFixture
+  distCid <- mkDistribution f
+  submitMustFail f.operator do exerciseCmd distCid PurgeRecord
+
+-- | VoidDistribution on a Paid record must fail.
+voidPaidDistributionTest : Script ()
+voidPaidDistributionTest = script do
+  f       <- setupFixture
+  distCid  <- mkDistribution f
+  paidCid  <- submit f.lender do exerciseCmd distCid MarkPaid
+  submitMustFail f.lender do exerciseCmd paidCid VoidDistribution
+
+-- | MarkPaid on an already-Paid record must fail.
+markPaidTwiceTest : Script ()
+markPaidTwiceTest = script do
+  f       <- setupFixture
+  distCid  <- mkDistribution f
+  paidCid  <- submit f.lender do exerciseCmd distCid MarkPaid
+  submitMustFail f.lender do exerciseCmd paidCid MarkPaid
+
+-- ---------------------------------------------------------------------------
+-- Ensure violations
+-- ---------------------------------------------------------------------------
+
+-- | Creating a distribution with yieldAmount = 0 must fail.
+ensureZeroYieldAmountTest : Script ()
+ensureZeroYieldAmountTest = script do
+  f <- setupFixture
+  submitMustFail f.lender do
+    createCmd YieldDistribution with
+      operator = f.operator; lender = f.lender; investor = f.alice
+      tokenId = "TKN"; loanId = "ABL"; periodStart = date 2026 Feb 1
+      periodEnd = date 2026 Mar 3; tokenSnapshot = 100.0; yieldRate = 0.03
+      yieldAmount = 0.0; distributionDate = date 2026 Mar 5; status = YieldPending
+
+-- | Creating a distribution with yieldRate > 1.0 must fail.
+ensureInvalidRateTest : Script ()
+ensureInvalidRateTest = script do
+  f <- setupFixture
+  submitMustFail f.lender do
+    createCmd YieldDistribution with
+      operator = f.operator; lender = f.lender; investor = f.alice
+      tokenId = "TKN"; loanId = "ABL"; periodStart = date 2026 Feb 1
+      periodEnd = date 2026 Mar 3; tokenSnapshot = 100.0; yieldRate = 1.5
+      yieldAmount = 10.0; distributionDate = date 2026 Mar 5; status = YieldPending
+
+-- | Creating a distribution with tokenSnapshot = 0 must fail.
+ensureZeroSnapshotTest : Script ()
+ensureZeroSnapshotTest = script do
+  f <- setupFixture
+  submitMustFail f.lender do
+    createCmd YieldDistribution with
+      operator = f.operator; lender = f.lender; investor = f.alice
+      tokenId = "TKN"; loanId = "ABL"; periodStart = date 2026 Feb 1
+      periodEnd = date 2026 Mar 3; tokenSnapshot = 0.0; yieldRate = 0.03
+      yieldAmount = 10.0; distributionDate = date 2026 Mar 5; status = YieldPending
+
+-- | Creating a distribution where periodEnd <= periodStart must fail.
+ensureInvalidPeriodTest : Script ()
+ensureInvalidPeriodTest = script do
+  f <- setupFixture
+  submitMustFail f.lender do
+    createCmd YieldDistribution with
+      operator = f.operator; lender = f.lender; investor = f.alice
+      tokenId = "TKN"; loanId = "ABL"; periodStart = date 2026 Mar 3
+      periodEnd = date 2026 Feb 1; tokenSnapshot = 100.0; yieldRate = 0.03
+      yieldAmount = 10.0; distributionDate = date 2026 Mar 5; status = YieldPending

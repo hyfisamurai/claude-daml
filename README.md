@@ -140,34 +140,38 @@ This project applies that same architecture to the ABL loan tokenization use cas
 The contract system is organized as a **hierarchy of composable modules**, each responsible for exactly one domain concern. Higher-level modules call lower-level ones; no module reaches sideways into a peer's internals.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    MODULE DEPENDENCY HIERARCHY                       │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │              SecondaryMarket.daml  (Layer 4)                │   │
-│  │         Listing · Matching · Settlement · Reporting          │   │
-│  └────────────────────────┬────────────────────────────────────┘   │
-│                           │ depends on                              │
-│  ┌────────────────────────▼────────────────────────────────────┐   │
-│  │               LoanToken.daml  (Layer 3)                     │   │
-│  │      Token issuance · Transfer · Yield · Redemption          │   │
-│  └──────────┬───────────────────────────┬───────────────────────┘   │
-│             │ depends on                │ depends on                 │
-│  ┌──────────▼──────────┐   ┌───────────▼─────────────────────┐    │
-│  │  LoanOrigination    │   │  InvestorRegistry.daml (Layer 2) │    │
-│  │  .daml  (Layer 2)   │   │  KYC · Reg D · Accreditation     │    │
-│  └──────────┬──────────┘   └─────────────────────────────────┘    │
-│             │ depends on                                             │
-│  ┌──────────▼──────────────────────────────────────────────────┐   │
-│  │             CollateralRegistry.daml  (Layer 1)               │   │
-│  │        Asset registration · Appraisal · LTV · Lien           │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │               Compliance.daml  (Cross-cutting)               │   │
-│  │      Party whitelist · Reg D attestation · AML screening     │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                      MODULE DEPENDENCY HIERARCHY                          │
+│                                                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │                 SecondaryMarket.daml  (Layer 4)                  │    │
+│  │           Listing · Matching · Settlement · Reporting             │    │
+│  └───────────────────────────────┬──────────────────────────────────┘    │
+│                                  │ depends on                             │
+│  ┌────────────────────────────┐  │  ┌───────────────────────────────┐    │
+│  │  YieldDistribution.daml   │  │  │     LoanToken.daml (Layer 3)  │    │
+│  │  (Layer 3.5)              │◄─┴─►│  Issuance · Transfer · Yield  │    │
+│  │  Yield records · Pending  │     │  Redemption · AccrueYield      │    │
+│  │  → Paid · audit trail     │     └──────────┬──────────┬──────────┘    │
+│  └────────────────────────────┘               │          │                │
+│                                    depends on │          │ depends on     │
+│  ┌─────────────────────────────┐             │  ┌───────▼─────────────┐  │
+│  │   LoanOrigination.daml      │◄────────────┘  │ InvestorRegistry    │  │
+│  │   (Layer 2)                 │                │ .daml  (Layer 2)    │  │
+│  │   Application · Commitment  │                │ KYC · Reg D ·       │  │
+│  │   ActiveLoan · LTV          │                │ Accreditation       │  │
+│  └──────────────┬──────────────┘                └─────────────────────┘  │
+│                 │ depends on                                               │
+│  ┌──────────────▼──────────────────────────────────────────────────┐     │
+│  │              CollateralRegistry.daml  (Layer 1)                  │     │
+│  │         Asset registration · Appraisal · LTV · Lien              │     │
+│  └──────────────────────────────────────────────────────────────────┘     │
+│                                                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │                  Compliance.daml  (Cross-cutting)                 │    │
+│  │         Party whitelist · Reg D attestation · AML screening       │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -177,7 +181,7 @@ The contract system is organized as a **hierarchy of composable modules**, each 
 ### `Types.daml` — Shared Foundation
 **Responsibility:** Defines all shared types, enums, and pure utility functions. Has no dependencies on other project modules — everything else imports from here.
 
-Key types: `CollateralAssetType`, `AssetStatus`, `LoanStatus`, `PaymentFrequency`, `KYCStatus`, `AccreditationTier`, `TokenStatus`, `ListingStatus`, `LoanTerms`, `CollateralInfo`, `TokenTranche`
+Key types: `CollateralAssetType`, `AssetStatus`, `LoanStatus`, `PaymentFrequency`, `KYCStatus`, `AccreditationTier`, `TokenStatus`, `ListingStatus`, `YieldStatus`, `LoanTerms`, `CollateralInfo`, `TokenTranche`
 
 Key utilities: `calculateDailyInterest`, `computeLTV`, `isValidRate`, `isValidLTV`, `loanDurationDays`, `proRataShare`
 
@@ -274,6 +278,19 @@ Key choices on `IssuedToken`:
 
 ---
 
+### `YieldDistribution.daml` — Layer 3.5: Yield Payment Audit Trail
+**Responsibility:** Provides the immutable per-investor, per-period on-ledger record of yield payments. `IssuedToken.AccrueYield` computes yield but leaves no persisted record; `YieldDistribution` closes that loop and is the on-chain equivalent of a 1099-INT. Depends only on `Types`.
+
+Key templates:
+- `YieldDistribution` — lender-issued yield record; fields: token/loan reference, accrual period, token snapshot, yield rate, computed USD yield, and `YieldStatus`
+
+Key choices:
+- `MarkPaid` (lender) — `YieldPending` → `YieldPaid`; cash has been delivered off-chain; creates a new contract with updated status
+- `VoidDistribution` (lender) — archives a `YieldPending` record on calculation error; lender re-issues a corrected distribution
+- `PurgeRecord` (operator) — archives a `YieldPaid` record after the regulatory retention period
+
+---
+
 ### `SecondaryMarket.daml` — Layer 4: Reg D Marketplace
 **Responsibility:** Operates the on-chain secondary market where accredited investors list and settle fractional loan tokens via atomic DVP on Canton.
 
@@ -334,7 +351,8 @@ Step 6 — ONGOING SERVICING & YIELD
   Borrower makes periodic payments → Lender calls RecordPayment (on ActiveLoan)
   Lender calls AccrueYield (nonconsuming, on IssuedToken) per investor per period
     → returns USD yield = investorYield × tokenFaceValue × tokenAmount × (days/365)
-  Yield settled off-chain or via separate payment contract
+  Lender creates YieldDistribution (YieldPending) for each investor → on-chain yield record
+  Lender delivers cash off-chain → calls MarkPaid → YieldDistribution status = YieldPaid
   Lender calls nonconsuming GetLTVStatus → monitors covenant (triggers margin call if needed)
 
 Step 7 — LOAN MATURITY / REPAYMENT
@@ -410,6 +428,7 @@ daml test --files daml/CollateralRegistry.daml
 daml test --files daml/LoanOrigination.daml
 daml test --files daml/InvestorRegistry.daml
 daml test --files daml/LoanToken.daml
+daml test --files daml/YieldDistribution.daml
 daml test --files daml/SecondaryMarket.daml
 ```
 
@@ -443,6 +462,7 @@ claude-daml/
     ├── LoanOrigination.daml        # Layer 2: ABL loan lifecycle
     ├── InvestorRegistry.daml       # Layer 2: Accredited investor onboarding
     ├── LoanToken.daml              # Layer 3: Fractional token issuance & yield
+    ├── YieldDistribution.daml      # Layer 3.5: Yield payment audit trail
     ├── SecondaryMarket.daml        # Layer 4: Reg D marketplace (listing, DVP)
     │
     │   ── Test modules (Daml Script) ──────────────────────────────────────
@@ -452,8 +472,9 @@ claude-daml/
     ├── LoanOriginationTest.daml    # 22 tests — loan pipeline, LTV, defaults
     ├── InvestorRegistryTest.daml   # 24 tests — onboarding, limits, eligibility
     ├── LoanTokenTest.daml          # 24 tests — issuance, transfer, yield, freeze
+    ├── YieldDistributionTest.daml  # 17 tests — yield lifecycle, guards, ensures
     ├── SecondaryMarketTest.daml    # 22 tests — DVP, compliance gate, audit trail
-    └── E2ETest.daml                # 1 test  — full lifecycle integration (all 7 modules)
+    └── E2ETest.daml                #  1 test  — full lifecycle integration (all 8 modules)
 ```
 
 ---
@@ -470,28 +491,31 @@ claude-daml/
 | 5 | `InvestorRegistry.daml` — `OnboardingRequest` + `InvestorProfile` subscription tracking | ✅ Complete | 24 |
 | 6 | `LoanToken.daml` — `IssuedToken` compliance-gated transfer, yield accrual, redemption | ✅ Complete | 24 |
 | 7 | `SecondaryMarket.daml` — `TokenListing` + `TradeRecord` atomic DVP settlement | ✅ Complete | 22 |
-| 7a | `E2ETest.daml` — single-script full lifecycle integration test (all 7 modules) | ✅ Complete | 1 |
+| 7a | `YieldDistribution.daml` — per-investor yield payment records; `YieldPending` → `YieldPaid` | ✅ Complete | 17 |
+| 7b | `E2ETest.daml` — single-script full lifecycle integration test (all 8 modules) | ✅ Complete | 1 |
 | 8 | Canton Network sandbox deployment & integration smoke test | Planned | — |
 | 9 | TypeScript codegen (`daml codegen js`) + React reference UI | Planned | — |
 | 10 | Reg D compliance audit & legal review | Planned | — |
 
-**137 Daml Script tests** pass across all seven source modules (phases 1–7), including one end-to-end integration test spanning the full deal lifecycle.
+**154 Daml Script tests** pass across all eight source modules (phases 1–7a), including one end-to-end integration test spanning the full deal lifecycle.
 
 ### Completed architecture at a glance
 
 ```
-SecondaryMarket   TokenListing · TradeRecord · DVP settlement
+SecondaryMarket      TokenListing · TradeRecord · DVP settlement
       ▲
-LoanToken         IssuedToken · TokenIssuance · yield · freeze · redeem
-      ▲                ▲
-LoanOrigination   LoanApplication · LoanCommitment · ActiveLoan
-InvestorRegistry  OnboardingRequest · InvestorProfile
-      ▲                ▲
-CollateralRegistry  CollateralAsset · appraisal · lien lifecycle
+LoanToken            IssuedToken · TokenIssuance · yield · freeze · redeem
+      ▲                    ▲
+      │          YieldDistribution  YieldPending → YieldPaid · audit trail
+      │
+LoanOrigination      LoanApplication · LoanCommitment · ActiveLoan
+InvestorRegistry     OnboardingRequest · InvestorProfile
+      ▲                    ▲
+CollateralRegistry   CollateralAsset · appraisal · lien lifecycle
       ▲
-Compliance        ParticipantKYC · InvestorAccreditation
+Compliance           ParticipantKYC · InvestorAccreditation
       ▲
-Types             Enums · record types · pure utilities
+Types                Enums · record types · pure utilities
 ```
 
 ---

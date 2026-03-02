@@ -130,6 +130,12 @@ data ListingStatus
   | ListingExpired    -- ^ Passed expiry date without a match
   deriving (Eq, Ord, Show)
 
+-- | Settlement status of an on-chain yield distribution record.
+data YieldStatus
+  = YieldPending  -- ^ Yield computed; cash delivery to investor pending
+  | YieldPaid     -- ^ Cash delivered off-chain; record kept for audit
+  deriving (Eq, Ord, Show)
+
 -- ---------------------------------------------------------------------------
 -- Reusable composite record types
 -- ---------------------------------------------------------------------------

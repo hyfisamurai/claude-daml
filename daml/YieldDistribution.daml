@@ -1,0 +1,100 @@
+-- | On-ledger yield distribution records for fractional loan tokens.
+--
+-- Provides the immutable per-investor, per-period audit trail for yield
+-- payments that @IssuedToken.AccrueYield@ computes but does not persist.
+-- In a real deployment this is the on-chain equivalent of a 1099-INT —
+-- every yield payment the lender makes to an investor is recorded here
+-- before (or alongside) the off-chain cash wire.
+--
+-- Two-state lifecycle:
+--
+-- @
+--   YieldDistribution (YieldPending)
+--       │ MarkPaid (lender)        — cash delivered; status → YieldPaid
+--       │ VoidDistribution (lender) — calculation error; archive and re-issue
+--       ▼
+--   YieldDistribution (YieldPaid)
+--       │ PurgeRecord (operator)   — archive after regulatory retention period
+-- @
+--
+-- Design decisions:
+-- * @signatory lender@ keeps the record issuer accountable.
+-- * Investor is an @observer@ — they can see (and later dispute) their record
+--   but cannot unilaterally modify it.
+-- * Operator is an @observer@ for platform-level reporting.
+-- * @VoidDistribution@ simply archives (no terminal state contract is created),
+--   mirroring the @RevokeKYC@ pattern — void = gone from the ledger.
+-- * @PurgeRecord@ requires @YieldPaid@ status — the lender must confirm
+--   cash delivery before the operator can purge the record.
+--
+-- Dependency order: Types → YieldDistribution
+module YieldDistribution where
+
+import DA.Date (Date)
+import Types
+
+-- ---------------------------------------------------------------------------
+-- YieldDistribution
+-- ---------------------------------------------------------------------------
+
+-- | Immutable on-ledger record of a yield payment from lender to investor.
+--
+-- Created by the lender after calling @IssuedToken.AccrueYield@ to capture
+-- the computed amount. The lender then delivers the cash off-chain and calls
+-- @MarkPaid@, advancing the record to @YieldPaid@.
+template YieldDistribution
+  with
+    operator         : Operator
+    lender           : Lender
+    investor         : Investor
+    tokenId          : TokenId         -- ^ Token tranche this yield relates to
+    loanId           : LoanId          -- ^ Backing loan reference
+    periodStart      : Date            -- ^ Start of accrual period (inclusive)
+    periodEnd        : Date            -- ^ End of accrual period (exclusive)
+    tokenSnapshot    : Decimal         -- ^ Token units held during this period
+    yieldRate        : Decimal         -- ^ Annualized investor yield (e.g., 0.03)
+    yieldAmount      : Decimal         -- ^ USD yield for this period
+    distributionDate : Date            -- ^ Date the lender created this record
+    status           : YieldStatus     -- ^ YieldPending | YieldPaid
+  where
+    signatory lender
+    observer  operator, investor
+
+    ensure yieldAmount   > 0.0 &&
+           tokenSnapshot > 0.0 &&
+           isValidRate yieldRate &&
+           periodEnd > periodStart
+
+    -- | Mark the yield as paid — cash has been delivered to the investor.
+    --
+    -- Archives this contract and creates a new @YieldDistribution@ with
+    -- @status = YieldPaid@, preserving the full record for audit purposes.
+    choice MarkPaid : ContractId YieldDistribution
+      controller lender
+      do
+        assertMsg "MarkPaid: distribution must be Pending to mark as paid"
+          (status == YieldPending)
+        create this with status = YieldPaid
+
+    -- | Void a pending distribution due to a calculation error.
+    --
+    -- Archives this contract without creating a replacement.
+    -- The lender should immediately create a corrected @YieldDistribution@
+    -- with the accurate @yieldAmount@.
+    choice VoidDistribution : ()
+      controller lender
+      do
+        assertMsg "VoidDistribution: only Pending distributions can be voided"
+          (status == YieldPending)
+        return ()
+
+    -- | Archive a paid record after the regulatory retention period.
+    --
+    -- Only the operator may purge records, and only after the lender has
+    -- confirmed cash delivery (status must be @YieldPaid@).
+    choice PurgeRecord : ()
+      controller operator
+      do
+        assertMsg "PurgeRecord: only Paid distributions can be purged"
+          (status == YieldPaid)
+        return ()
