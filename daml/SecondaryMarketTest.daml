@@ -1,0 +1,498 @@
+-- | Daml Script tests for the SecondaryMarket module.
+-- Covers: full DVP lifecycle (full and partial sale), listing cancel/revoke/expire,
+-- compliance gate (KYC, investor profile), state guards, ensure violations,
+-- authorization guards, TradeRecord audit trail, and multi-hop trading.
+module SecondaryMarketTest where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import DA.Optional (None, Some)
+import Types
+import Compliance
+import CollateralRegistry
+import LoanOrigination
+import InvestorRegistry
+import LoanToken
+import SecondaryMarket
+
+-- ---------------------------------------------------------------------------
+-- Test fixture
+-- ---------------------------------------------------------------------------
+
+data MarketFixture = MarketFixture
+  with
+    operator : Party
+    lender   : Party
+    borrower : Party
+    alice    : Party   -- primary seller
+    bob      : Party   -- buyer
+    carol    : Party   -- second buyer (multi-hop tests)
+    mallory  : Party   -- unauthorized party
+
+setupFixture : Script MarketFixture
+setupFixture = do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "Operator")
+  lender   <- allocatePartyWithHint "Lender"   (PartyIdHint "Lender")
+  borrower <- allocatePartyWithHint "Borrower" (PartyIdHint "Borrower")
+  alice    <- allocatePartyWithHint "Alice"    (PartyIdHint "Alice")
+  bob      <- allocatePartyWithHint "Bob"      (PartyIdHint "Bob")
+  carol    <- allocatePartyWithHint "Carol"    (PartyIdHint "Carol")
+  mallory  <- allocatePartyWithHint "Mallory"  (PartyIdHint "Mallory")
+  return MarketFixture with ..
+
+-- | Standard token tranche: 1M units × $1 face, 3% yield.
+standardTranche : TokenTranche
+standardTranche = TokenTranche with
+  totalTokens    = 1_000_000.0
+  tokenFaceValue = 1.0
+  investorYield  = 0.03
+
+-- ---------------------------------------------------------------------------
+-- Shared helpers
+-- ---------------------------------------------------------------------------
+
+-- | Approve KYC for any party.
+approveKYC : Party -> Party -> Script (ContractId ParticipantKYC)
+approveKYC operator participant = do
+  cid <- submit operator do
+    createCmd ParticipantKYC with
+      operator        = operator
+      participant     = participant
+      participantName = "Participant"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 1
+      jurisdiction    = "US"
+  submit operator do exerciseCmd cid ApproveKYC
+
+-- | Issue accreditation and create an active InvestorProfile ($1M cap).
+onboardInvestor : Party -> Party -> Script (ContractId ParticipantKYC, ContractId InvestorProfile)
+onboardInvestor operator investor = do
+  kycCid    <- approveKYC operator investor
+  accredCid <- submit operator do
+    createCmd InvestorAccreditation with
+      operator        = operator
+      investor        = investor
+      investorName    = "Investor"
+      tier            = Entity506c
+      attestationDate = date 2026 Jan 1
+      expiryDate      = date 2027 Jan 1
+  reqCid <- submit investor do
+    createCmd OnboardingRequest with
+      operator     = operator
+      investor     = investor
+      investorName = "Investor"
+      tier         = Entity506c
+      requestedMax = 1_000_000.0
+      submittedOn  = date 2026 Jan 1
+  profileCid <- submit operator do
+    exerciseCmd reqCid ApproveOnboarding with
+      accreditationCid = accredCid
+      approvedMax      = 1_000_000.0
+  return (kycCid, profileCid)
+
+-- | Fund a loan and return an ActiveLoan CID.
+fundLoan : MarketFixture -> Script (ContractId ActiveLoan)
+fundLoan f = do
+  colCid <- submit f.operator do
+    createCmd CollateralAsset with
+      operator  = f.operator
+      lender    = f.lender
+      borrower  = f.borrower
+      assetInfo = CollateralInfo with
+        assetId = "ASSET-RE-001"; assetType = RealEstate
+        description = "Test warehouse"; location = "Chicago, IL"
+        appraisedValue = 2_000_000.0; appraisalDate = date 2026 Jan 1
+      status = AssetRegistered; loanId = None
+  borrowerKycCid <- approveKYC f.operator f.borrower
+  appCid <- submit f.borrower do
+    createCmd LoanApplication with
+      operator = f.operator; lender = f.lender; borrower = f.borrower
+      loanId = "ABL-2026-0001"; requestedAmount = 1_000_000.0
+      collateralAssetId = "ASSET-RE-001"; submittedOn = date 2026 Jan 1
+  commCid <- submit f.lender do
+    exerciseCmd appCid IssueCommitment with
+      terms = LoanTerms with
+        principal = 1_000_000.0; annualInterestRate = 0.08
+        originationDate = date 2026 Jan 1; maturityDate = date 2027 Jan 1
+        paymentFrequency = Monthly; maxLTV = 0.75
+      issuedOn = date 2026 Jan 1
+  (activeCid, _) <- submit f.borrower do
+    exerciseCmd commCid AcceptCommitment with
+      collateralCid = colCid; borrowerKycId = borrowerKycCid
+  return activeCid
+
+-- | Mint an IssuedToken for Alice (full tranche).
+mintAliceToken : MarketFixture -> ContractId ActiveLoan
+             -> Script (ContractId IssuedToken, ContractId ParticipantKYC, ContractId InvestorProfile)
+mintAliceToken f loanCid = do
+  (aliceKycCid, aliceProfileCid) <- onboardInvestor f.operator f.alice
+  issuanceCid <- submit f.lender do
+    createCmd TokenIssuance with
+      operator = f.operator; lender = f.lender
+      loanId = "ABL-2026-0001"; tokenId = "TKN-0001-A"
+      tranche = standardTranche; issuedOn = date 2026 Jan 1
+      loanCid = loanCid
+  tokenCid <- submit f.lender do
+    exerciseCmd issuanceCid MintAllocation with
+      investor = f.alice; allocationAmount = 1_000_000.0
+      receiverKycId = aliceKycCid; receiverProfileId = aliceProfileCid
+  return (tokenCid, aliceKycCid, aliceProfileCid)
+
+-- | Post an open listing for Alice's tokens.
+postListing : MarketFixture -> ContractId IssuedToken -> Decimal -> Decimal
+           -> Script (ContractId TokenListing)
+postListing f tokenCid amount price = submit f.alice do
+  createCmd TokenListing with
+    operator = f.operator; lender = f.lender; seller = f.alice
+    tokenCid = tokenCid; tokenId = "TKN-0001-A"; loanId = "ABL-2026-0001"
+    listingAmount = amount; askPricePerUnit = price
+    listedOn = date 2026 Feb 1; expiryDate = date 2026 Dec 31
+    status = ListingOpen
+
+-- ---------------------------------------------------------------------------
+-- Full DVP lifecycle
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: full sale — seller's entire position transfers to buyer.
+fullDVPTest : Script ()
+fullDVPTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 1_000_000.0 0.95
+
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+
+  (tradeCid, buyerTokenCid, residual) <- submit f.lender do
+    exerciseCmd listingCid MatchListing with
+      buyer          = f.bob
+      settlementDate = date 2026 Mar 1
+      buyerKycId     = bobKycCid
+      buyerProfileId = bobProfileCid
+
+  assertMsg "full sale should leave no residual" (residual == None)
+
+-- | Happy path: partial sale — seller retains a residual token.
+partialDVPTest : Script ()
+partialDVPTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  -- Alice lists 400k of her 1M units.
+  listingCid <- postListing f tokenCid 400_000.0 0.97
+
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+
+  (tradeCid, buyerTokenCid, residual) <- submit f.lender do
+    exerciseCmd listingCid MatchListing with
+      buyer          = f.bob
+      settlementDate = date 2026 Mar 1
+      buyerKycId     = bobKycCid
+      buyerProfileId = bobProfileCid
+
+  case residual of
+    None   -> assertFail "partial sale should leave Alice a residual token"
+    Some _ -> return ()
+
+-- | TradeRecord is created correctly in a full sale.
+tradeRecordAuditTest : Script ()
+tradeRecordAuditTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95
+
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+
+  (tradeCid, _, _) <- submit f.lender do
+    exerciseCmd listingCid MatchListing with
+      buyer = f.bob; settlementDate = date 2026 Mar 1
+      buyerKycId = bobKycCid; buyerProfileId = bobProfileCid
+
+  -- TradeRecord is visible to the operator for reporting.
+  submit f.operator do exerciseCmd tradeCid PurgeRecord
+
+-- ---------------------------------------------------------------------------
+-- Multi-hop: buyer re-lists and sells to a third party
+-- ---------------------------------------------------------------------------
+
+-- | Alice → Bob → Carol: two sequential secondary market trades.
+multiHopTradeTest : Script ()
+multiHopTradeTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+
+  -- Hop 1: Alice sells 600k units to Bob.
+  listing1Cid <- postListing f tokenCid 600_000.0 0.95
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+  (_, bobTokenCid, _) <- submit f.lender do
+    exerciseCmd listing1Cid MatchListing with
+      buyer = f.bob; settlementDate = date 2026 Mar 1
+      buyerKycId = bobKycCid; buyerProfileId = bobProfileCid
+
+  -- Hop 2: Bob re-lists and sells 300k units to Carol.
+  carolListingCid <- submit f.bob do
+    createCmd TokenListing with
+      operator = f.operator; lender = f.lender; seller = f.bob
+      tokenCid = bobTokenCid; tokenId = "TKN-0001-A"; loanId = "ABL-2026-0001"
+      listingAmount = 300_000.0; askPricePerUnit = 0.98
+      listedOn = date 2026 Apr 1; expiryDate = date 2026 Dec 31
+      status = ListingOpen
+
+  (carolKycCid, carolProfileCid) <- onboardInvestor f.operator f.carol
+  (_, _, _) <- submit f.lender do
+    exerciseCmd carolListingCid MatchListing with
+      buyer = f.carol; settlementDate = date 2026 Apr 15
+      buyerKycId = carolKycCid; buyerProfileId = carolProfileCid
+
+  return ()
+
+-- ---------------------------------------------------------------------------
+-- Listing lifecycle choices
+-- ---------------------------------------------------------------------------
+
+-- | Seller cancels the listing before a match.
+cancelListingTest : Script ()
+cancelListingTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95
+  submit f.alice do exerciseCmd listingCid CancelListing
+
+-- | Lender revokes the listing on compliance grounds.
+revokeListingTest : Script ()
+revokeListingTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95
+  submit f.lender do exerciseCmd listingCid RevokeListing
+
+-- | Lender expires a stale listing.
+expireListingTest : Script ()
+expireListingTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95
+  submit f.lender do exerciseCmd listingCid ExpireListing
+
+-- | Mallory cannot cancel Alice's listing.
+unauthorizedCancelTest : Script ()
+unauthorizedCancelTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95
+  submitMustFail f.mallory do exerciseCmd listingCid CancelListing
+
+-- | Only lender can match a listing.
+unauthorizedMatchTest : Script ()
+unauthorizedMatchTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+  submitMustFail f.alice do
+    exerciseCmd listingCid MatchListing with
+      buyer = f.bob; settlementDate = date 2026 Mar 1
+      buyerKycId = bobKycCid; buyerProfileId = bobProfileCid
+
+-- ---------------------------------------------------------------------------
+-- MatchListing compliance gate
+-- ---------------------------------------------------------------------------
+
+-- | Buyer KYC is Pending — match must fail.
+matchPendingKYCTest : Script ()
+matchPendingKYCTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95
+
+  pendingKycCid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator = f.operator; participant = f.bob; participantName = "Bob"
+      kycStatus = KYCPending; submittedOn = date 2026 Jan 1; jurisdiction = "US"
+  (_, bobProfileCid) <- onboardInvestor f.operator f.bob
+
+  submitMustFail f.lender do
+    exerciseCmd listingCid MatchListing with
+      buyer = f.bob; settlementDate = date 2026 Mar 1
+      buyerKycId = pendingKycCid; buyerProfileId = bobProfileCid
+
+-- | Buyer KYC belongs to wrong party — match must fail.
+matchWrongKYCOwnerTest : Script ()
+matchWrongKYCOwnerTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95
+
+  -- Carol's approved KYC, but we name Bob as buyer.
+  (carolKycCid, _)   <- onboardInvestor f.operator f.carol
+  (_, bobProfileCid) <- onboardInvestor f.operator f.bob
+
+  submitMustFail f.lender do
+    exerciseCmd listingCid MatchListing with
+      buyer = f.bob; settlementDate = date 2026 Mar 1
+      buyerKycId = carolKycCid     -- wrong owner
+      buyerProfileId = bobProfileCid
+
+-- | Buyer investor profile is inactive — match must fail.
+matchInactiveProfileTest : Script ()
+matchInactiveProfileTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95
+
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+  deactivatedCid <- submit f.operator do exerciseCmd bobProfileCid DeactivateProfile
+
+  submitMustFail f.lender do
+    exerciseCmd listingCid MatchListing with
+      buyer = f.bob; settlementDate = date 2026 Mar 1
+      buyerKycId = bobKycCid; buyerProfileId = deactivatedCid
+
+-- | Buyer investor profile belongs to wrong party — match must fail.
+matchWrongProfileOwnerTest : Script ()
+matchWrongProfileOwnerTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95
+
+  (bobKycCid, _)       <- onboardInvestor f.operator f.bob
+  (_, carolProfileCid) <- onboardInvestor f.operator f.carol
+
+  submitMustFail f.lender do
+    exerciseCmd listingCid MatchListing with
+      buyer = f.bob; settlementDate = date 2026 Mar 1
+      buyerKycId = bobKycCid; buyerProfileId = carolProfileCid  -- wrong owner
+
+-- | Match rejected after listing expiry date.
+matchAfterExpiryTest : Script ()
+matchAfterExpiryTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95  -- expires 2026-12-31
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+
+  submitMustFail f.lender do
+    exerciseCmd listingCid MatchListing with
+      buyer = f.bob; settlementDate = date 2027 Jan 15  -- after expiry
+      buyerKycId = bobKycCid; buyerProfileId = bobProfileCid
+
+-- ---------------------------------------------------------------------------
+-- State guards
+-- ---------------------------------------------------------------------------
+
+-- | Cannot cancel an already-cancelled listing (contract is archived after CancelListing).
+-- We verify this by attempting to cancel the same CID twice.
+doubleCancelTest : Script ()
+doubleCancelTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  listingCid <- postListing f tokenCid 500_000.0 0.95
+  submit f.alice do exerciseCmd listingCid CancelListing
+  -- CancelListing archived the contract; second attempt must fail.
+  submitMustFail f.alice do exerciseCmd listingCid CancelListing
+
+-- | Cannot create a listing in Settled status (ensure violation).
+settledListingAtCreationTest : Script ()
+settledListingAtCreationTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  submitMustFail f.alice do
+    createCmd TokenListing with
+      operator = f.operator; lender = f.lender; seller = f.alice
+      tokenCid = tokenCid; tokenId = "TKN-0001-A"; loanId = "ABL-2026-0001"
+      listingAmount = 500_000.0; askPricePerUnit = 0.95
+      listedOn = date 2026 Feb 1; expiryDate = date 2026 Dec 31
+      status = ListingSettled   -- violates ensure
+
+-- ---------------------------------------------------------------------------
+-- TokenListing ensure violations
+-- ---------------------------------------------------------------------------
+
+-- | ensure: listing amount must be positive.
+zeroListingAmountTest : Script ()
+zeroListingAmountTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  submitMustFail f.alice do
+    createCmd TokenListing with
+      operator = f.operator; lender = f.lender; seller = f.alice
+      tokenCid = tokenCid; tokenId = "TKN-0001-A"; loanId = "ABL-2026-0001"
+      listingAmount = 0.0; askPricePerUnit = 0.95
+      listedOn = date 2026 Feb 1; expiryDate = date 2026 Dec 31
+      status = ListingOpen
+
+-- | ensure: ask price must be positive.
+zeroAskPriceTest : Script ()
+zeroAskPriceTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  submitMustFail f.alice do
+    createCmd TokenListing with
+      operator = f.operator; lender = f.lender; seller = f.alice
+      tokenCid = tokenCid; tokenId = "TKN-0001-A"; loanId = "ABL-2026-0001"
+      listingAmount = 500_000.0; askPricePerUnit = 0.0
+      listedOn = date 2026 Feb 1; expiryDate = date 2026 Dec 31
+      status = ListingOpen
+
+-- | ensure: expiry must be after listing date.
+expiryBeforeListingTest : Script ()
+expiryBeforeListingTest = script do
+  f <- setupFixture
+  loanCid <- fundLoan f
+  (tokenCid, _, _) <- mintAliceToken f loanCid
+  submitMustFail f.alice do
+    createCmd TokenListing with
+      operator = f.operator; lender = f.lender; seller = f.alice
+      tokenCid = tokenCid; tokenId = "TKN-0001-A"; loanId = "ABL-2026-0001"
+      listingAmount = 500_000.0; askPricePerUnit = 0.95
+      listedOn = date 2026 Feb 1; expiryDate = date 2026 Jan 1  -- before listedOn
+      status = ListingOpen
+
+-- ---------------------------------------------------------------------------
+-- TradeRecord ensure / PurgeRecord
+-- ---------------------------------------------------------------------------
+
+-- | ensure on TradeRecord: totalConsideration must equal amount × price.
+inconsistentTradeRecordTest : Script ()
+inconsistentTradeRecordTest = script do
+  f <- setupFixture
+  submitMustFail f.lender do
+    createCmd TradeRecord with
+      operator = f.operator; lender = f.lender
+      seller = f.alice; buyer = f.bob
+      tokenId = "TKN-0001-A"; loanId = "ABL-2026-0001"
+      tradedAmount = 100_000.0; pricePerUnit = 0.95
+      totalConsideration = 99_000.0  -- wrong: should be 95_000
+      settlementDate = date 2026 Mar 1
+
+-- | Only operator can purge a TradeRecord.
+unauthorizedPurgeTest : Script ()
+unauthorizedPurgeTest = script do
+  f <- setupFixture
+  tradeCid <- submit f.lender do
+    createCmd TradeRecord with
+      operator = f.operator; lender = f.lender
+      seller = f.alice; buyer = f.bob
+      tokenId = "TKN-0001-A"; loanId = "ABL-2026-0001"
+      tradedAmount = 100_000.0; pricePerUnit = 0.95
+      totalConsideration = 95_000.0
+      settlementDate = date 2026 Mar 1
+  submitMustFail f.lender do exerciseCmd tradeCid PurgeRecord
+  submitMustFail f.alice  do exerciseCmd tradeCid PurgeRecord
+  submit f.operator do exerciseCmd tradeCid PurgeRecord

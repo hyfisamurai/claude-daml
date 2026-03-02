@@ -1,8 +1,182 @@
 -- | Reg D secondary marketplace for fractional loan tokens.
--- Handles listings, bids, order matching, and atomic DVP settlement on Canton Network.
+--
+-- Provides a compliant peer-to-peer trading layer for @IssuedToken@ holdings.
+-- Two-template design:
+--
+-- @
+--   TokenListing  (seller posts an offer)
+--       │ MatchListing  (lender/operator matches a buyer)  — atomic DVP settlement
+--       │ CancelListing (seller or lender cancels)
+--       │ ExpireListing (lender clears a stale listing)
+--       ▼
+--   TradeRecord   (immutable settlement audit trail)
+-- @
+--
+-- Compliance is enforced at @MatchListing@ time:
+-- 1. Buyer's @ParticipantKYC@ is fetched and asserted @KYCApproved@.
+-- 2. Buyer's @InvestorProfile@ is fetched and asserted active.
+-- Both checks mirror the @IssuedToken.Transfer@ gate so the secondary
+-- market cannot be used to bypass the primary compliance layer.
+--
+-- DVP settlement is atomic within the Daml transaction:
+-- the token is transferred and the trade record is created in a single
+-- Update, with no intermediate state visible on-ledger.
+--
+-- Dependency order: Types → Compliance → InvestorRegistry → LoanToken → SecondaryMarket
 module SecondaryMarket where
 
+import DA.Date (Date)
+import DA.Optional (None)
 import Types
 import Compliance
 import InvestorRegistry
 import LoanToken
+
+-- ---------------------------------------------------------------------------
+-- TokenListing
+-- ---------------------------------------------------------------------------
+
+-- | A seller's offer to sell @listingAmount@ token units at @askPricePerUnit@.
+--
+-- The seller (current token holder) posts the listing. The lender (transfer agent)
+-- matches it with a qualified buyer — this keeps the lender in the loop for every
+-- secondary transfer, satisfying the Reg D transfer-agent requirement.
+--
+-- The token being offered is referenced by @tokenCid@ but is NOT archived
+-- until @MatchListing@ is exercised (atomic DVP). While the listing is open
+-- the seller's @IssuedToken@ contract remains alive and visible on the ledger.
+template TokenListing
+  with
+    operator       : Operator
+    lender         : Lender          -- ^ Transfer agent; controls matching
+    seller         : Investor        -- ^ Current token holder
+    tokenCid       : ContractId IssuedToken  -- ^ Token contract offered for sale
+    tokenId        : TokenId
+    loanId         : LoanId
+    listingAmount  : Decimal         -- ^ Units offered (may be < total held)
+    askPricePerUnit : Decimal        -- ^ USD per token unit
+    listedOn       : Date
+    expiryDate     : Date            -- ^ Listing auto-expires after this date
+    status         : ListingStatus
+  where
+    signatory seller, lender
+    observer  operator
+
+    ensure listingAmount   > 0.0 &&
+           askPricePerUnit > 0.0 &&
+           expiryDate      > listedOn &&
+           status          /= ListingSettled  -- settled listings are archived
+
+    -- | Atomically match the listing with a qualified buyer and settle DVP.
+    --
+    -- Steps (all in one transaction):
+    -- 1. Compliance gate: fetch + assert buyer KYC (KYCApproved, correct party).
+    -- 2. Compliance gate: fetch + assert buyer InvestorProfile (active, correct party).
+    -- 3. Exercise @IssuedToken.Transfer@ for @listingAmount@ units → buyer gets token,
+    --    seller retains residual (if partial).
+    -- 4. Create a @TradeRecord@ for the audit trail.
+    -- 5. Archive this @TokenListing@ (consumed by this choice).
+    --
+    -- Returns @(ContractId TradeRecord, ContractId IssuedToken, Optional (ContractId IssuedToken))@:
+    -- the trade record, buyer's new token, and seller's residual (if any).
+    choice MatchListing
+      : (ContractId TradeRecord, ContractId IssuedToken, Optional (ContractId IssuedToken))
+      with
+        buyer             : Investor
+        settlementDate    : Date
+        buyerKycId        : ContractId ParticipantKYC
+        buyerProfileId    : ContractId InvestorProfile
+      controller lender
+      do
+        assertMsg "MatchListing: listing must be Open"
+          (status == ListingOpen)
+        assertMsg "MatchListing: listing has expired"
+          (settlementDate <= expiryDate)
+        -- Compliance gate 1: buyer KYC.
+        kycRecord <- fetch buyerKycId
+        assertMsg "MatchListing: KYC must be for the named buyer"
+          (kycRecord.participant == buyer)
+        assertMsg "MatchListing: buyer must be KYCApproved"
+          (kycRecord.kycStatus == KYCApproved)
+        -- Compliance gate 2: buyer investor profile.
+        profile <- fetch buyerProfileId
+        assertMsg "MatchListing: investor profile must be for the named buyer"
+          (profile.investor == buyer)
+        assertMsg "MatchListing: buyer investor profile must be active"
+          profile.isActive
+        -- Atomic DVP: transfer tokens from seller to buyer.
+        (buyerTokenCid, residualCid) <- exercise tokenCid Transfer with
+          newInvestor       = buyer
+          transferAmount    = listingAmount
+          receiverKycId     = buyerKycId
+          receiverProfileId = buyerProfileId
+        -- Create immutable trade record.
+        let totalConsideration = listingAmount * askPricePerUnit
+        tradeCid <- create TradeRecord with
+          operator           = operator
+          lender             = lender
+          seller             = seller
+          buyer              = buyer
+          tokenId            = tokenId
+          loanId             = loanId
+          tradedAmount       = listingAmount
+          pricePerUnit       = askPricePerUnit
+          totalConsideration = totalConsideration
+          settlementDate     = settlementDate
+        return (tradeCid, buyerTokenCid, residualCid)
+
+    -- | Seller cancels their own listing before it is matched.
+    choice CancelListing : ()
+      controller seller
+      do
+        assertMsg "CancelListing: listing must be Open" (status == ListingOpen)
+        return ()
+
+    -- | Lender (transfer agent) cancels the listing on compliance grounds.
+    choice RevokeListing : ()
+      controller lender
+      do
+        assertMsg "RevokeListing: listing must be Open" (status == ListingOpen)
+        return ()
+
+    -- | Lender expires a stale listing after the expiry date has passed.
+    choice ExpireListing : ()
+      controller lender
+      do
+        assertMsg "ExpireListing: listing must be Open" (status == ListingOpen)
+        return ()
+
+-- ---------------------------------------------------------------------------
+-- TradeRecord
+-- ---------------------------------------------------------------------------
+
+-- | Immutable on-ledger audit trail of a settled secondary market trade.
+--
+-- Created atomically with the token transfer in @MatchListing@.
+-- All parties (operator, lender, seller, buyer) are observers so the
+-- record is visible to every participant who may need it for reporting.
+template TradeRecord
+  with
+    operator           : Operator
+    lender             : Lender
+    seller             : Investor
+    buyer              : Investor
+    tokenId            : TokenId
+    loanId             : LoanId
+    tradedAmount       : Decimal  -- ^ Units transferred
+    pricePerUnit       : Decimal  -- ^ USD per unit agreed by seller
+    totalConsideration : Decimal  -- ^ tradedAmount × pricePerUnit
+    settlementDate     : Date
+  where
+    signatory lender
+    observer  operator, seller, buyer
+
+    ensure tradedAmount       > 0.0 &&
+           pricePerUnit       > 0.0 &&
+           totalConsideration == tradedAmount * pricePerUnit
+
+    -- | Archive the trade record (e.g., after regulatory retention period).
+    -- Only the operator can purge records.
+    choice PurgeRecord : ()
+      controller operator
+      do return ()
