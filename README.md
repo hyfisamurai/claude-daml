@@ -400,46 +400,65 @@ claude-daml/
 ├── CLAUDE.md                       # AI assistant guide (coding conventions, workflow)
 ├── README.md                       # This file
 ├── LICENSE                         # MIT
-├── daml.yaml                       # Daml SDK manifest
+├── daml.yaml                       # Daml SDK manifest (sdk-version: 2.9.0)
 │
-├── daml/
-│   ├── Compliance.daml             # Cross-cutting: KYC, AML, Reg D whitelist
-│   ├── CollateralRegistry.daml     # Layer 1: Hard asset registration & liens
-│   ├── LoanOrigination.daml        # Layer 2: ABL loan lifecycle
-│   ├── InvestorRegistry.daml       # Layer 2: Accredited investor onboarding
-│   ├── LoanToken.daml              # Layer 3: Fractional token issuance & yield
-│   ├── SecondaryMarket.daml        # Layer 4: Reg D marketplace (listing, DVP)
-│   └── Types.daml                  # Shared types and utility functions
-│
-├── daml-test/
-│   ├── ComplianceTest.daml
-│   ├── CollateralRegistryTest.daml
-│   ├── LoanOriginationTest.daml
-│   ├── InvestorRegistryTest.daml
-│   ├── LoanTokenTest.daml
-│   └── SecondaryMarketTest.daml
-│
-└── scripts/
-    ├── build.sh                    # daml build wrapper
-    ├── test.sh                     # daml test wrapper
-    └── sandbox.sh                  # sandbox + navigator startup
+└── daml/                           # All source and test modules (co-located)
+    │
+    │   ── Production modules ──────────────────────────────────────────────
+    ├── Types.daml                  # Shared types, enums, and pure utilities
+    ├── Compliance.daml             # Cross-cutting: KYC/AML whitelist, Reg D
+    ├── CollateralRegistry.daml     # Layer 1: Hard asset registration & liens
+    ├── LoanOrigination.daml        # Layer 2: ABL loan lifecycle
+    ├── InvestorRegistry.daml       # Layer 2: Accredited investor onboarding
+    ├── LoanToken.daml              # Layer 3: Fractional token issuance & yield
+    ├── SecondaryMarket.daml        # Layer 4: Reg D marketplace (listing, DVP)
+    │
+    │   ── Test modules (Daml Script) ──────────────────────────────────────
+    ├── TypesTest.daml              # 10 tests — utility function correctness
+    ├── ComplianceTest.daml         # 14 tests — KYC lifecycle, Reg D, guards
+    ├── CollateralRegistryTest.daml # 20 tests — registration, appraisal, liens
+    ├── LoanOriginationTest.daml    # 22 tests — loan pipeline, LTV, defaults
+    ├── InvestorRegistryTest.daml   # 24 tests — onboarding, limits, eligibility
+    ├── LoanTokenTest.daml          # 24 tests — issuance, transfer, yield, freeze
+    └── SecondaryMarketTest.daml    # 22 tests — DVP, compliance gate, audit trail
 ```
 
 ---
 
 ## 10. Roadmap
 
-| Phase | Milestone | Status |
-|-------|-----------|--------|
-| 0 | Repository setup, CLAUDE.md, README | ✅ Complete |
-| 1 | `Compliance.daml` + tests | Planned |
-| 2 | `CollateralRegistry.daml` + tests | Planned |
-| 3 | `LoanOrigination.daml` + tests | Planned |
-| 4 | `InvestorRegistry.daml` + tests | Planned |
-| 5 | `LoanToken.daml` + yield distribution + tests | Planned |
-| 6 | `SecondaryMarket.daml` + atomic DVP + tests | Planned |
-| 7 | Canton Network deployment | Planned |
-| 8 | Reg D compliance audit | Planned |
+| Phase | Milestone | Status | Tests |
+|-------|-----------|--------|-------|
+| 0 | Repository setup, `CLAUDE.md`, `README.md`, `daml.yaml` | ✅ Complete | — |
+| 1 | `Types.daml` — shared enums, record types, pure utility functions | ✅ Complete | 10 |
+| 2 | `Compliance.daml` — `ParticipantKYC` lifecycle, `InvestorAccreditation` Reg D | ✅ Complete | 14 |
+| 3 | `CollateralRegistry.daml` — `CollateralAsset` registration, appraisal, lien perfection | ✅ Complete | 20 |
+| 4 | `LoanOrigination.daml` — `LoanApplication` → `LoanCommitment` → `ActiveLoan` pipeline | ✅ Complete | 22 |
+| 5 | `InvestorRegistry.daml` — `OnboardingRequest` + `InvestorProfile` subscription tracking | ✅ Complete | 24 |
+| 6 | `LoanToken.daml` — `IssuedToken` compliance-gated transfer, yield accrual, redemption | ✅ Complete | 24 |
+| 7 | `SecondaryMarket.daml` — `TokenListing` + `TradeRecord` atomic DVP settlement | ✅ Complete | 22 |
+| 8 | Canton Network sandbox deployment & integration smoke test | Planned | — |
+| 9 | TypeScript codegen (`daml codegen js`) + React reference UI | Planned | — |
+| 10 | Reg D compliance audit & legal review | Planned | — |
+
+**136 Daml Script tests** pass across all seven source modules (phases 1–7).
+
+### Completed architecture at a glance
+
+```
+SecondaryMarket   TokenListing · TradeRecord · DVP settlement
+      ▲
+LoanToken         IssuedToken · TokenIssuance · yield · freeze · redeem
+      ▲                ▲
+LoanOrigination   LoanApplication · LoanCommitment · ActiveLoan
+InvestorRegistry  OnboardingRequest · InvestorProfile
+      ▲                ▲
+CollateralRegistry  CollateralAsset · appraisal · lien lifecycle
+      ▲
+Compliance        ParticipantKYC · InvestorAccreditation
+      ▲
+Types             Enums · record types · pure utilities
+```
 
 ---
 
