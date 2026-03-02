@@ -1,0 +1,417 @@
+-- | Daml Script tests for the CollateralRegistry module.
+-- Covers: asset registration, appraisal updates, full lien lifecycle,
+-- liquidation path, KYC gate on PerfectLien, authorization guards,
+-- state-transition guards, ensure preconditions, and LTV queries.
+module CollateralRegistryTest where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import DA.Optional (Some, None)
+import Types
+import Compliance
+import CollateralRegistry
+
+-- ---------------------------------------------------------------------------
+-- Test fixture
+-- ---------------------------------------------------------------------------
+
+data RegistryFixture = RegistryFixture
+  with
+    operator  : Party
+    lender    : Party
+    borrower  : Party
+    appraiser : Party
+    mallory   : Party
+
+setupFixture : Script RegistryFixture
+setupFixture = do
+  operator  <- allocatePartyWithHint "Operator"  (PartyIdHint "Operator")
+  lender    <- allocatePartyWithHint "Lender"    (PartyIdHint "Lender")
+  borrower  <- allocatePartyWithHint "Borrower"  (PartyIdHint "Borrower")
+  appraiser <- allocatePartyWithHint "Appraiser" (PartyIdHint "Appraiser")
+  mallory   <- allocatePartyWithHint "Mallory"   (PartyIdHint "Mallory")
+  return RegistryFixture with ..
+
+-- | Create an approved KYC record for the borrower.
+approveBorrowerKYC : Party -> Party -> Script (ContractId ParticipantKYC)
+approveBorrowerKYC operator borrower = do
+  pendingCid <- submit operator do
+    createCmd ParticipantKYC with
+      operator        = operator
+      participant     = borrower
+      participantName = "Borrower Corp LLC"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 1
+      jurisdiction    = "US"
+  submit operator do exerciseCmd pendingCid ApproveKYC
+
+-- | Build a minimal CollateralInfo for tests.
+testAssetInfo : CollateralInfo
+testAssetInfo = CollateralInfo with
+  assetId        = "ASSET-RE-001"
+  assetType      = RealEstate
+  description    = "Industrial warehouse, 50,000 sq ft"
+  location       = "123 Commerce Dr, Chicago, IL 60601"
+  appraisedValue = 2_000_000.0
+  appraisalDate  = date 2026 Jan 15
+
+-- | Register a CollateralAsset in AssetRegistered state.
+registerAsset : RegistryFixture -> Script (ContractId CollateralAsset)
+registerAsset f = submit f.operator do
+  createCmd CollateralAsset with
+    operator  = f.operator
+    lender    = f.lender
+    borrower  = f.borrower
+    assetInfo = testAssetInfo
+    status    = AssetRegistered
+    loanId    = None
+
+-- ---------------------------------------------------------------------------
+-- Registration
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: operator creates a valid CollateralAsset.
+assetRegistrationTest : Script ()
+assetRegistrationTest = script do
+  f   <- setupFixture
+  cid <- registerAsset f
+  -- Fetch and spot-check the registered state.
+  asset <- submit f.lender do
+    exerciseCmd cid GetCurrentLTV with outstandingBalance = 0.0
+  assertMsg "LTV on zero balance should be 0.0" (asset == 0.0)
+
+-- | ensure: appraisedValue must be positive.
+zeroAppraisalValueTest : Script ()
+zeroAppraisalValueTest = script do
+  f <- setupFixture
+  submitMustFail f.operator do
+    createCmd CollateralAsset with
+      operator  = f.operator
+      lender    = f.lender
+      borrower  = f.borrower
+      assetInfo = testAssetInfo with appraisedValue = 0.0
+      status    = AssetRegistered
+      loanId    = None
+
+-- | ensure: released assets must carry no loanId.
+releasedWithLoanIdTest : Script ()
+releasedWithLoanIdTest = script do
+  f <- setupFixture
+  -- Directly creating a Released asset with a loanId violates the ensure clause.
+  submitMustFail f.operator do
+    createCmd CollateralAsset with
+      operator  = f.operator
+      lender    = f.lender
+      borrower  = f.borrower
+      assetInfo = testAssetInfo
+      status    = AssetReleased
+      loanId    = Some "ABL-2026-0001"
+
+-- ---------------------------------------------------------------------------
+-- Appraisal update
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: operator updates appraisal on a registered asset.
+appraisalUpdateRegisteredTest : Script ()
+appraisalUpdateRegisteredTest = script do
+  f   <- setupFixture
+  cid <- registerAsset f
+
+  updatedCid <- submit f.operator do
+    exerciseCmd cid UpdateAppraisal with
+      appraiser         = f.appraiser
+      newAppraisedValue = 2_200_000.0
+      newAppraisalDate  = date 2026 Jun 1
+
+  -- LTV on updated asset: $1.1M outstanding / $2.2M collateral = 50%.
+  ltv <- submit f.lender do
+    exerciseCmd updatedCid GetCurrentLTV with outstandingBalance = 1_100_000.0
+  assertMsg ("expected LTV 0.5, got " <> show ltv) (ltv == 0.5)
+
+-- | Happy path: appraisal update also works on an encumbered asset.
+appraisalUpdateEncumberedTest : Script ()
+appraisalUpdateEncumberedTest = script do
+  f      <- setupFixture
+  cid    <- registerAsset f
+  kycCid <- approveBorrowerKYC f.operator f.borrower
+
+  encCid <- submit f.lender do
+    exerciseCmd cid PerfectLien with
+      forLoanId     = "ABL-2026-0001"
+      borrowerKycId = kycCid
+
+  _ <- submit f.operator do
+    exerciseCmd encCid UpdateAppraisal with
+      appraiser         = f.appraiser
+      newAppraisedValue = 1_800_000.0
+      newAppraisalDate  = date 2026 Sep 1
+
+  return ()
+
+-- | Non-operator cannot update appraisal.
+unauthorizedAppraisalTest : Script ()
+unauthorizedAppraisalTest = script do
+  f   <- setupFixture
+  cid <- registerAsset f
+
+  submitMustFail f.lender do
+    exerciseCmd cid UpdateAppraisal with
+      appraiser         = f.appraiser
+      newAppraisedValue = 2_500_000.0
+      newAppraisalDate  = date 2026 Jun 1
+
+-- | Zero appraisal value rejected by UpdateAppraisal guard.
+updateToZeroValueTest : Script ()
+updateToZeroValueTest = script do
+  f   <- setupFixture
+  cid <- registerAsset f
+
+  submitMustFail f.operator do
+    exerciseCmd cid UpdateAppraisal with
+      appraiser         = f.appraiser
+      newAppraisedValue = 0.0
+      newAppraisalDate  = date 2026 Jun 1
+
+-- | Cannot appraise a released asset.
+appraisalOnReleasedAssetTest : Script ()
+appraisalOnReleasedAssetTest = script do
+  f      <- setupFixture
+  cid    <- registerAsset f
+  kycCid <- approveBorrowerKYC f.operator f.borrower
+
+  encCid <- submit f.lender do
+    exerciseCmd cid PerfectLien with
+      forLoanId = "ABL-2026-0001"; borrowerKycId = kycCid
+
+  relCid <- submit f.lender do exerciseCmd encCid ReleaseLien
+
+  submitMustFail f.operator do
+    exerciseCmd relCid UpdateAppraisal with
+      appraiser         = f.appraiser
+      newAppraisedValue = 2_000_000.0
+      newAppraisalDate  = date 2026 Dec 1
+
+-- ---------------------------------------------------------------------------
+-- Lien lifecycle: repayment path
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: Register → PerfectLien → ReleaseLien (full repayment).
+lienRepaymentLifecycleTest : Script ()
+lienRepaymentLifecycleTest = script do
+  f      <- setupFixture
+  cid    <- registerAsset f
+  kycCid <- approveBorrowerKYC f.operator f.borrower
+
+  -- Lender perfects the lien (KYC gate checked on-chain).
+  encCid <- submit f.lender do
+    exerciseCmd cid PerfectLien with
+      forLoanId     = "ABL-2026-0001"
+      borrowerKycId = kycCid
+
+  -- Loan repaid; lender releases the lien.
+  _ <- submit f.lender do exerciseCmd encCid ReleaseLien
+  return ()
+
+-- ---------------------------------------------------------------------------
+-- Lien lifecycle: default / liquidation path
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: Register → PerfectLien → LiquidateAsset (default).
+liquidationLifecycleTest : Script ()
+liquidationLifecycleTest = script do
+  f      <- setupFixture
+  cid    <- registerAsset f
+  kycCid <- approveBorrowerKYC f.operator f.borrower
+
+  encCid <- submit f.lender do
+    exerciseCmd cid PerfectLien with
+      forLoanId = "ABL-2026-0001"; borrowerKycId = kycCid
+
+  -- Borrower defaults; lender liquidates the collateral.
+  _ <- submit f.lender do
+    exerciseCmd encCid LiquidateAsset with
+      liquidationProceeds = 1_750_000.0
+
+  return ()
+
+-- | Liquidation proceeds of zero are accepted (distressed sale).
+zeroLiquidationProceedsTest : Script ()
+zeroLiquidationProceedsTest = script do
+  f      <- setupFixture
+  cid    <- registerAsset f
+  kycCid <- approveBorrowerKYC f.operator f.borrower
+
+  encCid <- submit f.lender do
+    exerciseCmd cid PerfectLien with
+      forLoanId = "ABL-2026-0001"; borrowerKycId = kycCid
+
+  _ <- submit f.lender do
+    exerciseCmd encCid LiquidateAsset with liquidationProceeds = 0.0
+  return ()
+
+-- | Negative liquidation proceeds are rejected.
+negativeProceedsTest : Script ()
+negativeProceedsTest = script do
+  f      <- setupFixture
+  cid    <- registerAsset f
+  kycCid <- approveBorrowerKYC f.operator f.borrower
+
+  encCid <- submit f.lender do
+    exerciseCmd cid PerfectLien with
+      forLoanId = "ABL-2026-0001"; borrowerKycId = kycCid
+
+  submitMustFail f.lender do
+    exerciseCmd encCid LiquidateAsset with liquidationProceeds = -1.0
+
+-- ---------------------------------------------------------------------------
+-- KYC gate on PerfectLien
+-- ---------------------------------------------------------------------------
+
+-- | PerfectLien rejected when borrower KYC is not approved.
+kycNotApprovedPerfectLienTest : Script ()
+kycNotApprovedPerfectLienTest = script do
+  f <- setupFixture
+  cid <- registerAsset f
+
+  -- Create but do NOT approve the KYC record.
+  pendingKycCid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.borrower
+      participantName = "Borrower Corp LLC"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 1
+      jurisdiction    = "US"
+
+  submitMustFail f.lender do
+    exerciseCmd cid PerfectLien with
+      forLoanId     = "ABL-2026-0001"
+      borrowerKycId = pendingKycCid
+
+-- | PerfectLien rejected when the KYC record belongs to a different party.
+wrongBorrowerKYCTest : Script ()
+wrongBorrowerKYCTest = script do
+  f      <- setupFixture
+  cid    <- registerAsset f
+  -- Approve KYC for mallory (not the borrower on the contract).
+  malloryKycCid <- approveBorrowerKYC f.operator f.mallory
+
+  submitMustFail f.lender do
+    exerciseCmd cid PerfectLien with
+      forLoanId     = "ABL-2026-0001"
+      borrowerKycId = malloryKycCid
+
+-- | PerfectLien rejected when borrower is KYCSuspended.
+suspendedBorrowerPerfectLienTest : Script ()
+suspendedBorrowerPerfectLienTest = script do
+  f   <- setupFixture
+  cid <- registerAsset f
+
+  -- Approve then immediately suspend.
+  approvedCid  <- approveBorrowerKYC f.operator f.borrower
+  suspendedCid <- submit f.operator do exerciseCmd approvedCid SuspendKYC
+
+  submitMustFail f.lender do
+    exerciseCmd cid PerfectLien with
+      forLoanId     = "ABL-2026-0001"
+      borrowerKycId = suspendedCid
+
+-- ---------------------------------------------------------------------------
+-- Authorization guards
+-- ---------------------------------------------------------------------------
+
+-- | Non-lender cannot perfect a lien.
+unauthorizedPerfectLienTest : Script ()
+unauthorizedPerfectLienTest = script do
+  f      <- setupFixture
+  cid    <- registerAsset f
+  kycCid <- approveBorrowerKYC f.operator f.borrower
+
+  submitMustFail f.mallory do
+    exerciseCmd cid PerfectLien with
+      forLoanId = "ABL-2026-0001"; borrowerKycId = kycCid
+
+-- | Non-lender cannot release a lien.
+unauthorizedReleaseLienTest : Script ()
+unauthorizedReleaseLienTest = script do
+  f      <- setupFixture
+  cid    <- registerAsset f
+  kycCid <- approveBorrowerKYC f.operator f.borrower
+
+  encCid <- submit f.lender do
+    exerciseCmd cid PerfectLien with
+      forLoanId = "ABL-2026-0001"; borrowerKycId = kycCid
+
+  submitMustFail f.mallory do exerciseCmd encCid ReleaseLien
+
+-- ---------------------------------------------------------------------------
+-- State-transition guards
+-- ---------------------------------------------------------------------------
+
+-- | Cannot perfect a lien on an already-encumbered asset.
+doubleEncumberTest : Script ()
+doubleEncumberTest = script do
+  f      <- setupFixture
+  cid    <- registerAsset f
+  kycCid <- approveBorrowerKYC f.operator f.borrower
+
+  encCid <- submit f.lender do
+    exerciseCmd cid PerfectLien with
+      forLoanId = "ABL-2026-0001"; borrowerKycId = kycCid
+
+  submitMustFail f.lender do
+    exerciseCmd encCid PerfectLien with
+      forLoanId = "ABL-2026-0002"; borrowerKycId = kycCid
+
+-- | Cannot release a lien on a merely registered (not yet encumbered) asset.
+releaseUnencumberedTest : Script ()
+releaseUnencumberedTest = script do
+  f   <- setupFixture
+  cid <- registerAsset f
+  submitMustFail f.lender do exerciseCmd cid ReleaseLien
+
+-- | Cannot liquidate a merely registered asset.
+liquidateUnencumberedTest : Script ()
+liquidateUnencumberedTest = script do
+  f   <- setupFixture
+  cid <- registerAsset f
+  submitMustFail f.lender do
+    exerciseCmd cid LiquidateAsset with liquidationProceeds = 1_000_000.0
+
+-- ---------------------------------------------------------------------------
+-- LTV query (nonconsuming)
+-- ---------------------------------------------------------------------------
+
+-- | GetCurrentLTV returns correct values at multiple balance points.
+ltvQueryTest : Script ()
+ltvQueryTest = script do
+  f   <- setupFixture
+  cid <- registerAsset f  -- appraisedValue = $2,000,000
+
+  let check balance expected = do
+        ltv <- submit f.lender do
+          exerciseCmd cid GetCurrentLTV with outstandingBalance = balance
+        assertMsg
+          ("LTV for balance " <> show balance <> ": expected " <> show expected <> ", got " <> show ltv)
+          (ltv == expected)
+
+  check 0.0         0.0   -- zero balance → 0% LTV
+  check 1_000_000.0 0.5   -- $1M / $2M    → 50% LTV
+  check 2_000_000.0 1.0   -- $2M / $2M    → 100% LTV (fully drawn)
+
+-- | Multiple nonconsuming LTV queries do not consume the asset contract.
+ltvQueryNonConsumingTest : Script ()
+ltvQueryNonConsumingTest = script do
+  f   <- setupFixture
+  cid <- registerAsset f
+
+  _ <- submit f.lender do exerciseCmd cid GetCurrentLTV with outstandingBalance = 500_000.0
+  _ <- submit f.lender do exerciseCmd cid GetCurrentLTV with outstandingBalance = 750_000.0
+  _ <- submit f.lender do exerciseCmd cid GetCurrentLTV with outstandingBalance = 1_000_000.0
+  -- Contract still alive — we can still register a new appraisal.
+  _ <- submit f.operator do
+    exerciseCmd cid UpdateAppraisal with
+      appraiser         = f.appraiser
+      newAppraisedValue = 2_100_000.0
+      newAppraisalDate  = date 2026 Jul 1
+  return ()
