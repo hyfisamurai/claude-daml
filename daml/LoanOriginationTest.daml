@@ -1,0 +1,426 @@
+-- | Daml Script tests for the LoanOrigination module.
+-- Covers: full repayment lifecycle, default/liquidation lifecycle,
+-- application withdraw/reject, commitment revoke/decline, authorization
+-- guards, state-guard assertions, ensure violations, and LTV queries.
+module LoanOriginationTest where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import DA.Optional (None)
+import Types
+import Compliance
+import CollateralRegistry
+import LoanOrigination
+
+-- ---------------------------------------------------------------------------
+-- Test fixture
+-- ---------------------------------------------------------------------------
+
+data LoanFixture = LoanFixture
+  with
+    operator : Party
+    lender   : Party
+    borrower : Party
+    mallory  : Party
+
+setupFixture : Script LoanFixture
+setupFixture = do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "Operator")
+  lender   <- allocatePartyWithHint "Lender"   (PartyIdHint "Lender")
+  borrower <- allocatePartyWithHint "Borrower" (PartyIdHint "Borrower")
+  mallory  <- allocatePartyWithHint "Mallory"  (PartyIdHint "Mallory")
+  return LoanFixture with ..
+
+-- | Standard loan terms: $1M, 8% p.a., 75% max LTV, 1-year term.
+standardTerms : LoanTerms
+standardTerms = LoanTerms with
+  principal          = 1_000_000.0
+  annualInterestRate = 0.08
+  originationDate    = date 2026 Jan 1
+  maturityDate       = date 2027 Jan 1
+  paymentFrequency   = Monthly
+  maxLTV             = 0.75
+
+-- | $2M warehouse: gives 50% LTV on a $1M loan (well within covenant).
+warehouseInfo : CollateralInfo
+warehouseInfo = CollateralInfo with
+  assetId        = "ASSET-RE-001"
+  assetType      = RealEstate
+  description    = "Industrial warehouse, 50,000 sq ft"
+  location       = "123 Commerce Dr, Chicago, IL 60601"
+  appraisedValue = 2_000_000.0
+  appraisalDate  = date 2026 Jan 1
+
+-- ---------------------------------------------------------------------------
+-- Shared helpers
+-- ---------------------------------------------------------------------------
+
+-- | Register a $2M warehouse as collateral in AssetRegistered state.
+mkCollateral : LoanFixture -> Script (ContractId CollateralAsset)
+mkCollateral f = submit f.operator do
+  createCmd CollateralAsset with
+    operator  = f.operator
+    lender    = f.lender
+    borrower  = f.borrower
+    assetInfo = warehouseInfo
+    status    = AssetRegistered
+    loanId    = None
+
+-- | Create and approve borrower KYC.
+mkBorrowerKYC : LoanFixture -> Script (ContractId ParticipantKYC)
+mkBorrowerKYC f = do
+  cid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.borrower
+      participantName = "Borrower Corp LLC"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 1
+      jurisdiction    = "US"
+  submit f.operator do exerciseCmd cid ApproveKYC
+
+-- | Borrower submits a loan application.
+mkApplication : LoanFixture -> Script (ContractId LoanApplication)
+mkApplication f = submit f.borrower do
+  createCmd LoanApplication with
+    operator          = f.operator
+    lender            = f.lender
+    borrower          = f.borrower
+    loanId            = "ABL-2026-0001"
+    requestedAmount   = 1_000_000.0
+    collateralAssetId = "ASSET-RE-001"
+    submittedOn       = date 2026 Jan 1
+
+-- | Full setup: collateral + KYC + application → funded ActiveLoan.
+-- Returns (ActiveLoan CID, encumbered CollateralAsset CID).
+fundLoan : LoanFixture
+        -> Script (ContractId ActiveLoan, ContractId CollateralAsset)
+fundLoan f = do
+  colCid  <- mkCollateral f
+  kycCid  <- mkBorrowerKYC f
+  appCid  <- mkApplication f
+  commCid <- submit f.lender do
+    exerciseCmd appCid IssueCommitment with
+      terms    = standardTerms
+      issuedOn = date 2026 Jan 1
+  submit f.borrower do
+    exerciseCmd commCid AcceptCommitment with
+      collateralCid = colCid
+      borrowerKycId = kycCid
+
+-- ---------------------------------------------------------------------------
+-- Happy path: full repayment lifecycle
+-- ---------------------------------------------------------------------------
+
+-- | Application → Commitment → ActiveLoan → payments → full repayment.
+-- The lien is released when the final payment is recorded.
+fullRepaymentLifecycleTest : Script ()
+fullRepaymentLifecycleTest = script do
+  f <- setupFixture
+  (activeCid, encCid) <- fundLoan f
+
+  -- Three partial payments totalling $700k.
+  a2 <- submit f.lender do exerciseCmd activeCid RecordPayment with paymentAmount = 200_000.0
+  a3 <- submit f.lender do exerciseCmd a2        RecordPayment with paymentAmount = 300_000.0
+  a4 <- submit f.lender do exerciseCmd a3        RecordPayment with paymentAmount = 200_000.0
+  -- Outstanding balance: $300,000.
+
+  -- Final $300k payment — lien is released, ActiveLoan archived.
+  _ <- submit f.lender do
+    exerciseCmd a4 RecordFullRepayment with
+      finalPayment  = 300_000.0
+      collateralCid = encCid
+  return ()
+
+-- | Single-payment full repayment (no partial payments).
+singlePaymentRepaymentTest : Script ()
+singlePaymentRepaymentTest = script do
+  f <- setupFixture
+  (activeCid, encCid) <- fundLoan f
+  _ <- submit f.lender do
+    exerciseCmd activeCid RecordFullRepayment with
+      finalPayment  = 1_000_000.0
+      collateralCid = encCid
+  return ()
+
+-- ---------------------------------------------------------------------------
+-- Happy path: default / liquidation lifecycle
+-- ---------------------------------------------------------------------------
+
+-- | ActiveLoan → DeclareDefault → collateral liquidated.
+defaultLifecycleTest : Script ()
+defaultLifecycleTest = script do
+  f <- setupFixture
+  (activeCid, encCid) <- fundLoan f
+
+  -- After one partial payment, borrower defaults.
+  a2 <- submit f.lender do exerciseCmd activeCid RecordPayment with paymentAmount = 100_000.0
+
+  _ <- submit f.lender do
+    exerciseCmd a2 DeclareDefault with
+      collateralCid       = encCid
+      liquidationProceeds = 1_750_000.0
+  return ()
+
+-- | Default with zero proceeds is valid (distressed sale).
+defaultZeroProceedsTest : Script ()
+defaultZeroProceedsTest = script do
+  f <- setupFixture
+  (activeCid, encCid) <- fundLoan f
+  _ <- submit f.lender do
+    exerciseCmd activeCid DeclareDefault with
+      collateralCid       = encCid
+      liquidationProceeds = 0.0
+  return ()
+
+-- ---------------------------------------------------------------------------
+-- Application-level choices
+-- ---------------------------------------------------------------------------
+
+-- | Borrower withdraws before the lender reviews.
+withdrawApplicationTest : Script ()
+withdrawApplicationTest = script do
+  f      <- setupFixture
+  appCid <- mkApplication f
+  submit f.borrower do exerciseCmd appCid WithdrawApplication
+
+-- | Lender rejects the application.
+rejectApplicationTest : Script ()
+rejectApplicationTest = script do
+  f      <- setupFixture
+  appCid <- mkApplication f
+  submit f.lender do exerciseCmd appCid RejectApplication
+
+-- | ensure: requested amount must be positive.
+zeroRequestedAmountTest : Script ()
+zeroRequestedAmountTest = script do
+  f <- setupFixture
+  submitMustFail f.borrower do
+    createCmd LoanApplication with
+      operator          = f.operator
+      lender            = f.lender
+      borrower          = f.borrower
+      loanId            = "ABL-2026-0001"
+      requestedAmount   = 0.0
+      collateralAssetId = "ASSET-RE-001"
+      submittedOn       = date 2026 Jan 1
+
+-- | Only the lender can issue a commitment.
+unauthorizedCommitmentTest : Script ()
+unauthorizedCommitmentTest = script do
+  f      <- setupFixture
+  appCid <- mkApplication f
+  submitMustFail f.mallory do
+    exerciseCmd appCid IssueCommitment with
+      terms    = standardTerms
+      issuedOn = date 2026 Jan 1
+
+-- | Borrower cannot self-issue a commitment.
+selfIssueCommitmentTest : Script ()
+selfIssueCommitmentTest = script do
+  f      <- setupFixture
+  appCid <- mkApplication f
+  submitMustFail f.borrower do
+    exerciseCmd appCid IssueCommitment with
+      terms    = standardTerms
+      issuedOn = date 2026 Jan 1
+
+-- ---------------------------------------------------------------------------
+-- Commitment-level choices
+-- ---------------------------------------------------------------------------
+
+-- | Borrower declines the commitment.
+declineCommitmentTest : Script ()
+declineCommitmentTest = script do
+  f      <- setupFixture
+  appCid <- mkApplication f
+  commCid <- submit f.lender do
+    exerciseCmd appCid IssueCommitment with
+      terms    = standardTerms
+      issuedOn = date 2026 Jan 1
+  submit f.borrower do exerciseCmd commCid DeclineCommitment
+
+-- | Lender revokes the commitment before borrower accepts.
+revokeCommitmentTest : Script ()
+revokeCommitmentTest = script do
+  f      <- setupFixture
+  appCid <- mkApplication f
+  commCid <- submit f.lender do
+    exerciseCmd appCid IssueCommitment with
+      terms    = standardTerms
+      issuedOn = date 2026 Jan 1
+  submit f.lender do exerciseCmd commCid RevokeCommitment
+
+-- | ensure: interest rate must be a valid proportion (≤ 1.0).
+invalidInterestRateTest : Script ()
+invalidInterestRateTest = script do
+  f      <- setupFixture
+  appCid <- mkApplication f
+  submitMustFail f.lender do
+    exerciseCmd appCid IssueCommitment with
+      terms    = standardTerms with annualInterestRate = 1.5
+      issuedOn = date 2026 Jan 1
+
+-- | ensure: max LTV must be a valid proportion (≤ 1.0).
+invalidMaxLTVTest : Script ()
+invalidMaxLTVTest = script do
+  f      <- setupFixture
+  appCid <- mkApplication f
+  submitMustFail f.lender do
+    exerciseCmd appCid IssueCommitment with
+      terms    = standardTerms with maxLTV = 1.5
+      issuedOn = date 2026 Jan 1
+
+-- | ensure: maturity must be strictly after origination.
+maturityBeforeOriginationTest : Script ()
+maturityBeforeOriginationTest = script do
+  f      <- setupFixture
+  appCid <- mkApplication f
+  submitMustFail f.lender do
+    exerciseCmd appCid IssueCommitment with
+      terms    = standardTerms with
+                   originationDate = date 2026 Jun 1
+                   maturityDate    = date 2026 Jan 1
+      issuedOn = date 2026 Jan 1
+
+-- | Only the borrower can accept a commitment.
+lenderSelfAcceptTest : Script ()
+lenderSelfAcceptTest = script do
+  f      <- setupFixture
+  colCid <- mkCollateral f
+  kycCid <- mkBorrowerKYC f
+  appCid <- mkApplication f
+  commCid <- submit f.lender do
+    exerciseCmd appCid IssueCommitment with
+      terms    = standardTerms
+      issuedOn = date 2026 Jan 1
+  submitMustFail f.lender do
+    exerciseCmd commCid AcceptCommitment with
+      collateralCid = colCid
+      borrowerKycId = kycCid
+
+-- ---------------------------------------------------------------------------
+-- ActiveLoan servicing guards
+-- ---------------------------------------------------------------------------
+
+-- | RecordPayment must be strictly less than outstanding balance.
+overpaymentTest : Script ()
+overpaymentTest = script do
+  f <- setupFixture
+  (activeCid, _) <- fundLoan f
+  -- Paying the full balance via RecordPayment is rejected; use RecordFullRepayment.
+  submitMustFail f.lender do
+    exerciseCmd activeCid RecordPayment with paymentAmount = 1_000_000.0
+
+-- | RecordPayment amount must be positive.
+zeroPaymentTest : Script ()
+zeroPaymentTest = script do
+  f <- setupFixture
+  (activeCid, _) <- fundLoan f
+  submitMustFail f.lender do
+    exerciseCmd activeCid RecordPayment with paymentAmount = 0.0
+
+-- | Non-lender cannot record a payment.
+unauthorizedRecordPaymentTest : Script ()
+unauthorizedRecordPaymentTest = script do
+  f <- setupFixture
+  (activeCid, _) <- fundLoan f
+  submitMustFail f.borrower do
+    exerciseCmd activeCid RecordPayment with paymentAmount = 100_000.0
+
+-- | RecordFullRepayment must exactly match the outstanding balance.
+wrongFinalPaymentAmountTest : Script ()
+wrongFinalPaymentAmountTest = script do
+  f <- setupFixture
+  (activeCid, encCid) <- fundLoan f
+  a2 <- submit f.lender do exerciseCmd activeCid RecordPayment with paymentAmount = 500_000.0
+  -- Balance is $500k; trying to repay $400k must fail.
+  submitMustFail f.lender do
+    exerciseCmd a2 RecordFullRepayment with
+      finalPayment  = 400_000.0
+      collateralCid = encCid
+
+-- | Non-lender cannot declare a default.
+unauthorizedDefaultTest : Script ()
+unauthorizedDefaultTest = script do
+  f <- setupFixture
+  (activeCid, encCid) <- fundLoan f
+  submitMustFail f.borrower do
+    exerciseCmd activeCid DeclareDefault with
+      collateralCid       = encCid
+      liquidationProceeds = 1_000_000.0
+
+-- ---------------------------------------------------------------------------
+-- LTV covenant monitoring (nonconsuming)
+-- ---------------------------------------------------------------------------
+
+-- | GetLTVStatus: $1M outstanding / $2M collateral = 50% → within 75% covenant.
+ltvWithinCovenantTest : Script ()
+ltvWithinCovenantTest = script do
+  f <- setupFixture
+  (activeCid, encCid) <- fundLoan f
+
+  (ltv, withinCovenant) <- submit f.lender do
+    exerciseCmd activeCid GetLTVStatus with collateralCid = encCid
+
+  assertMsg ("expected LTV 0.5, got " <> show ltv)  (ltv == 0.5)
+  assertMsg "50% LTV should be within 75% covenant"  withinCovenant
+
+-- | GetLTVStatus detects a breach when collateral value falls.
+ltvCovenantBreachTest : Script ()
+ltvCovenantBreachTest = script do
+  f <- setupFixture
+  -- Asset worth only $1.1M → $1M loan is 91% LTV, breaching 75% covenant.
+  lowColCid <- submit f.operator do
+    createCmd CollateralAsset with
+      operator  = f.operator
+      lender    = f.lender
+      borrower  = f.borrower
+      assetInfo = warehouseInfo with appraisedValue = 1_100_000.0
+      status    = AssetRegistered
+      loanId    = None
+  kycCid  <- mkBorrowerKYC f
+  appCid  <- mkApplication f
+  commCid <- submit f.lender do
+    exerciseCmd appCid IssueCommitment with
+      terms    = standardTerms
+      issuedOn = date 2026 Jan 1
+  (activeCid, encCid) <- submit f.borrower do
+    exerciseCmd commCid AcceptCommitment with
+      collateralCid = lowColCid
+      borrowerKycId = kycCid
+
+  (ltv, withinCovenant) <- submit f.lender do
+    exerciseCmd activeCid GetLTVStatus with collateralCid = encCid
+
+  assertMsg ("LTV should exceed 0.75, got " <> show ltv)  (ltv > 0.75)
+  assertMsg "Should flag covenant breach"                  (not withinCovenant)
+
+-- | Multiple GetLTVStatus calls do not consume the ActiveLoan.
+ltvNonConsumingTest : Script ()
+ltvNonConsumingTest = script do
+  f <- setupFixture
+  (activeCid, encCid) <- fundLoan f
+
+  _ <- submit f.lender do exerciseCmd activeCid GetLTVStatus with collateralCid = encCid
+  _ <- submit f.lender do exerciseCmd activeCid GetLTVStatus with collateralCid = encCid
+  _ <- submit f.lender do exerciseCmd activeCid GetLTVStatus with collateralCid = encCid
+  -- Loan is still alive — we can still record a payment.
+  _ <- submit f.lender do exerciseCmd activeCid RecordPayment with paymentAmount = 100_000.0
+  return ()
+
+-- | LTV improves as payments reduce the outstanding balance.
+ltvImprovesWithPaymentsTest : Script ()
+ltvImprovesWithPaymentsTest = script do
+  f <- setupFixture
+  (activeCid, encCid) <- fundLoan f   -- $1M / $2M = 50% LTV
+
+  (ltv1, _) <- submit f.lender do exerciseCmd activeCid GetLTVStatus with collateralCid = encCid
+  assertMsg ("initial LTV should be 0.5, got " <> show ltv1) (ltv1 == 0.5)
+
+  -- Pay down $500k → $500k / $2M = 25% LTV.
+  a2 <- submit f.lender do exerciseCmd activeCid RecordPayment with paymentAmount = 500_000.0
+
+  (ltv2, within) <- submit f.lender do exerciseCmd a2 GetLTVStatus with collateralCid = encCid
+  assertMsg ("post-payment LTV should be 0.25, got " <> show ltv2) (ltv2 == 0.25)
+  assertMsg "25% LTV is within 75% covenant" within

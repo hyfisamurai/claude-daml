@@ -1,0 +1,425 @@
+-- | Daml Script tests for the InvestorRegistry module.
+-- Covers: onboarding lifecycle, subscription tracking, profile management,
+-- eligibility checks, authorization guards, state guards, and ensure violations.
+module InvestorRegistryTest where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import Types
+import Compliance
+import InvestorRegistry
+
+-- ---------------------------------------------------------------------------
+-- Test fixture
+-- ---------------------------------------------------------------------------
+
+data RegistryFixture = RegistryFixture
+  with
+    operator : Party
+    investor : Party
+    mallory  : Party
+
+setupFixture : Script RegistryFixture
+setupFixture = do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "Operator")
+  investor <- allocatePartyWithHint "Investor" (PartyIdHint "Investor")
+  mallory  <- allocatePartyWithHint "Mallory"  (PartyIdHint "Mallory")
+  return RegistryFixture with ..
+
+-- ---------------------------------------------------------------------------
+-- Shared helpers
+-- ---------------------------------------------------------------------------
+
+-- | Issue and approve an InvestorAccreditation for the investor.
+mkAccreditation : RegistryFixture -> Script (ContractId InvestorAccreditation)
+mkAccreditation f = submit f.operator do
+  createCmd InvestorAccreditation with
+    operator        = f.operator
+    investor        = f.investor
+    investorName    = "Investor Capital LLC"
+    tier            = Entity506c
+    attestationDate = date 2026 Jan 1
+    expiryDate      = date 2027 Jan 1
+
+-- | Submit an onboarding request for the investor.
+mkRequest : RegistryFixture -> Script (ContractId OnboardingRequest)
+mkRequest f = submit f.investor do
+  createCmd OnboardingRequest with
+    operator     = f.operator
+    investor     = f.investor
+    investorName = "Investor Capital LLC"
+    tier         = Entity506c
+    requestedMax = 500_000.0
+    submittedOn  = date 2026 Jan 15
+
+-- | Full onboarding: request → approve → InvestorProfile with $500k cap.
+mkProfile : RegistryFixture -> Script (ContractId InvestorProfile, ContractId InvestorAccreditation)
+mkProfile f = do
+  accredCid <- mkAccreditation f
+  reqCid    <- mkRequest f
+  profileCid <- submit f.operator do
+    exerciseCmd reqCid ApproveOnboarding with
+      accreditationCid = accredCid
+      approvedMax      = 500_000.0
+  return (profileCid, accredCid)
+
+-- ---------------------------------------------------------------------------
+-- Onboarding lifecycle
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: request → ApproveOnboarding → InvestorProfile created.
+onboardingApproveTest : Script ()
+onboardingApproveTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  -- Profile exists; verify capacity starts at full limit.
+  capacity <- submit f.operator do
+    exerciseCmd profileCid GetAvailableCapacity
+  assertMsg ("expected $500k capacity, got " <> show capacity) (capacity == 500_000.0)
+
+-- | Operator rejects the onboarding request.
+onboardingRejectTest : Script ()
+onboardingRejectTest = script do
+  f      <- setupFixture
+  reqCid <- mkRequest f
+  submit f.operator do exerciseCmd reqCid RejectOnboarding
+
+-- | Investor withdraws the request before the operator reviews.
+onboardingWithdrawTest : Script ()
+onboardingWithdrawTest = script do
+  f      <- setupFixture
+  reqCid <- mkRequest f
+  submit f.investor do exerciseCmd reqCid WithdrawRequest
+
+-- | ensure: requestedMax must be positive.
+zeroRequestedMaxTest : Script ()
+zeroRequestedMaxTest = script do
+  f <- setupFixture
+  submitMustFail f.investor do
+    createCmd OnboardingRequest with
+      operator     = f.operator
+      investor     = f.investor
+      investorName = "Investor Capital LLC"
+      tier         = Entity506c
+      requestedMax = 0.0
+      submittedOn  = date 2026 Jan 15
+
+-- | ApproveOnboarding: accreditation must belong to this investor.
+wrongAccreditationOwnerTest : Script ()
+wrongAccreditationOwnerTest = script do
+  f <- setupFixture
+  -- Issue accreditation for mallory, not for investor.
+  malloryAccredCid <- submit f.operator do
+    createCmd InvestorAccreditation with
+      operator        = f.operator
+      investor        = f.mallory
+      investorName    = "Mallory Fund LLC"
+      tier            = Individual506c
+      attestationDate = date 2026 Jan 1
+      expiryDate      = date 2027 Jan 1
+
+  reqCid <- mkRequest f
+  submitMustFail f.operator do
+    exerciseCmd reqCid ApproveOnboarding with
+      accreditationCid = malloryAccredCid
+      approvedMax      = 500_000.0
+
+-- | ApproveOnboarding: approved limit must be positive.
+zeroApprovedMaxTest : Script ()
+zeroApprovedMaxTest = script do
+  f <- setupFixture
+  accredCid <- mkAccreditation f
+  reqCid    <- mkRequest f
+  submitMustFail f.operator do
+    exerciseCmd reqCid ApproveOnboarding with
+      accreditationCid = accredCid
+      approvedMax      = 0.0
+
+-- | Only the operator can approve an onboarding request.
+unauthorizedApproveTest : Script ()
+unauthorizedApproveTest = script do
+  f <- setupFixture
+  accredCid <- mkAccreditation f
+  reqCid    <- mkRequest f
+  submitMustFail f.mallory do
+    exerciseCmd reqCid ApproveOnboarding with
+      accreditationCid = accredCid
+      approvedMax      = 500_000.0
+
+-- ---------------------------------------------------------------------------
+-- Subscription tracking
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: invest → redeem → net position correct.
+investAndRedeemCycleTest : Script ()
+investAndRedeemCycleTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+
+  -- Invest $200k.
+  p2 <- submit f.operator do
+    exerciseCmd profileCid RecordInvestment with investmentAmount = 200_000.0
+
+  -- Invest another $100k.
+  p3 <- submit f.operator do
+    exerciseCmd p2 RecordInvestment with investmentAmount = 100_000.0
+
+  -- Redeem $50k.
+  p4 <- submit f.operator do
+    exerciseCmd p3 RecordRedemption with redemptionAmount = 50_000.0
+
+  -- Remaining capacity: $500k − ($300k − $50k) = $250k.
+  capacity <- submit f.operator do exerciseCmd p4 GetAvailableCapacity
+  assertMsg ("expected $250k capacity, got " <> show capacity) (capacity == 250_000.0)
+
+-- | Invest exactly up to the limit.
+investToLimitTest : Script ()
+investToLimitTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  _ <- submit f.operator do
+    exerciseCmd profileCid RecordInvestment with investmentAmount = 500_000.0
+  return ()
+
+-- | Investment that would push total over the limit is rejected.
+exceedLimitTest : Script ()
+exceedLimitTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+
+  p2 <- submit f.operator do
+    exerciseCmd profileCid RecordInvestment with investmentAmount = 400_000.0
+
+  -- $400k already invested; $200k more would exceed $500k cap.
+  submitMustFail f.operator do
+    exerciseCmd p2 RecordInvestment with investmentAmount = 200_000.0
+
+-- | Investment amount must be positive.
+zeroInvestmentTest : Script ()
+zeroInvestmentTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  submitMustFail f.operator do
+    exerciseCmd profileCid RecordInvestment with investmentAmount = 0.0
+
+-- | Redemption amount must be positive.
+zeroRedemptionTest : Script ()
+zeroRedemptionTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  p2 <- submit f.operator do
+    exerciseCmd profileCid RecordInvestment with investmentAmount = 100_000.0
+  submitMustFail f.operator do
+    exerciseCmd p2 RecordRedemption with redemptionAmount = 0.0
+
+-- | Redemption cannot exceed current investment.
+overRedemptionTest : Script ()
+overRedemptionTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  p2 <- submit f.operator do
+    exerciseCmd profileCid RecordInvestment with investmentAmount = 100_000.0
+  -- Only $100k invested; trying to redeem $200k must fail.
+  submitMustFail f.operator do
+    exerciseCmd p2 RecordRedemption with redemptionAmount = 200_000.0
+
+-- | Redemptions are permitted even when the profile is inactive (investor can exit).
+redemptionWhileInactiveTest : Script ()
+redemptionWhileInactiveTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  p2 <- submit f.operator do
+    exerciseCmd profileCid RecordInvestment with investmentAmount = 200_000.0
+  -- Deactivate the profile (e.g., compliance hold).
+  p3 <- submit f.operator do exerciseCmd p2 DeactivateProfile
+  -- Investor should still be able to redeem their position.
+  _ <- submit f.operator do
+    exerciseCmd p3 RecordRedemption with redemptionAmount = 200_000.0
+  return ()
+
+-- | New investments are blocked when the profile is inactive.
+investWhileInactiveTest : Script ()
+investWhileInactiveTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  p2 <- submit f.operator do exerciseCmd profileCid DeactivateProfile
+  submitMustFail f.operator do
+    exerciseCmd p2 RecordInvestment with investmentAmount = 100_000.0
+
+-- ---------------------------------------------------------------------------
+-- Profile management
+-- ---------------------------------------------------------------------------
+
+-- | Increase the investment limit.
+updateLimitIncreaseTest : Script ()
+updateLimitIncreaseTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  p2 <- submit f.operator do
+    exerciseCmd profileCid UpdateInvestmentLimit with newMax = 1_000_000.0
+  capacity <- submit f.operator do exerciseCmd p2 GetAvailableCapacity
+  assertMsg ("expected $1M capacity, got " <> show capacity) (capacity == 1_000_000.0)
+
+-- | Decrease the limit is valid as long as it's ≥ current investment.
+updateLimitDecreaseTest : Script ()
+updateLimitDecreaseTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  p2 <- submit f.operator do
+    exerciseCmd profileCid RecordInvestment with investmentAmount = 100_000.0
+  -- $100k invested; can reduce limit to $200k (above current investment).
+  _ <- submit f.operator do
+    exerciseCmd p2 UpdateInvestmentLimit with newMax = 200_000.0
+  return ()
+
+-- | Cannot set limit below current investment.
+limitBelowCurrentInvestmentTest : Script ()
+limitBelowCurrentInvestmentTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  p2 <- submit f.operator do
+    exerciseCmd profileCid RecordInvestment with investmentAmount = 300_000.0
+  -- $300k invested; can't lower limit to $200k.
+  submitMustFail f.operator do
+    exerciseCmd p2 UpdateInvestmentLimit with newMax = 200_000.0
+
+-- | Cannot set limit to zero.
+zeroLimitTest : Script ()
+zeroLimitTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  submitMustFail f.operator do
+    exerciseCmd profileCid UpdateInvestmentLimit with newMax = 0.0
+
+-- | Full deactivate → reactivate lifecycle.
+deactivateReactivateTest : Script ()
+deactivateReactivateTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  p2 <- submit f.operator do exerciseCmd profileCid DeactivateProfile
+  p3 <- submit f.operator do exerciseCmd p2 ReactivateProfile
+  -- Profile is active again; new investments should succeed.
+  _ <- submit f.operator do
+    exerciseCmd p3 RecordInvestment with investmentAmount = 100_000.0
+  return ()
+
+-- | Cannot deactivate an already-inactive profile.
+doubleDeactivateTest : Script ()
+doubleDeactivateTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  p2 <- submit f.operator do exerciseCmd profileCid DeactivateProfile
+  submitMustFail f.operator do exerciseCmd p2 DeactivateProfile
+
+-- | Cannot reactivate an already-active profile.
+doubleReactivateTest : Script ()
+doubleReactivateTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  submitMustFail f.operator do exerciseCmd profileCid ReactivateProfile
+
+-- ---------------------------------------------------------------------------
+-- VerifyEligibility (nonconsuming)
+-- ---------------------------------------------------------------------------
+
+-- | Eligible investor: active, accreditation current, capacity available.
+verifyEligibleTest : Script ()
+verifyEligibleTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+
+  eligible <- submit f.operator do
+    exerciseCmd profileCid VerifyEligibility with
+      investmentAmount = 100_000.0
+      asOfDate         = date 2026 Jun 1  -- within accred window (Jan 26 – Jan 27)
+
+  assertMsg "investor should be eligible" eligible
+
+-- | Ineligible: profile is deactivated.
+verifyInactiveProfileTest : Script ()
+verifyInactiveProfileTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+  p2 <- submit f.operator do exerciseCmd profileCid DeactivateProfile
+
+  eligible <- submit f.operator do
+    exerciseCmd p2 VerifyEligibility with
+      investmentAmount = 100_000.0
+      asOfDate         = date 2026 Jun 1
+
+  assertMsg "inactive investor should not be eligible" (not eligible)
+
+-- | Ineligible: accreditation has expired.
+verifyExpiredAccreditationTest : Script ()
+verifyExpiredAccreditationTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f  -- accreditation expires 2027-01-01
+
+  eligible <- submit f.operator do
+    exerciseCmd profileCid VerifyEligibility with
+      investmentAmount = 100_000.0
+      asOfDate         = date 2027 Jun 1  -- after accreditation expiry
+
+  assertMsg "expired accreditation should block eligibility" (not eligible)
+
+-- | Ineligible: investment would exceed capacity.
+verifyInsufficientCapacityTest : Script ()
+verifyInsufficientCapacityTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+
+  p2 <- submit f.operator do
+    exerciseCmd profileCid RecordInvestment with investmentAmount = 450_000.0
+
+  -- $450k already invested; requesting $100k more would exceed $500k cap.
+  eligible <- submit f.operator do
+    exerciseCmd p2 VerifyEligibility with
+      investmentAmount = 100_000.0
+      asOfDate         = date 2026 Jun 1
+
+  assertMsg "over-capacity investor should not be eligible" (not eligible)
+
+-- | Multiple VerifyEligibility calls do not consume the profile.
+verifyNonConsumingTest : Script ()
+verifyNonConsumingTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+
+  _ <- submit f.operator do
+    exerciseCmd profileCid VerifyEligibility with investmentAmount = 50_000.0; asOfDate = date 2026 Jun 1
+  _ <- submit f.operator do
+    exerciseCmd profileCid VerifyEligibility with investmentAmount = 50_000.0; asOfDate = date 2026 Jun 1
+  -- Profile still alive — can record an investment.
+  _ <- submit f.operator do
+    exerciseCmd profileCid RecordInvestment with investmentAmount = 50_000.0
+  return ()
+
+-- | Eligibility holds on the exact expiry date (expiryDate >= asOfDate).
+verifyExactExpiryDateTest : Script ()
+verifyExactExpiryDateTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f  -- expires 2027-01-01
+
+  eligible <- submit f.operator do
+    exerciseCmd profileCid VerifyEligibility with
+      investmentAmount = 100_000.0
+      asOfDate         = date 2027 Jan 1  -- exactly on expiry date — still valid
+
+  assertMsg "on-expiry-date should still be eligible" eligible
+
+-- | GetAvailableCapacity tracks correctly through invest/redeem cycle.
+capacityTrackingTest : Script ()
+capacityTrackingTest = script do
+  f <- setupFixture
+  (profileCid, _) <- mkProfile f
+
+  c0 <- submit f.operator do exerciseCmd profileCid GetAvailableCapacity
+  assertMsg "initial capacity should be $500k" (c0 == 500_000.0)
+
+  p2 <- submit f.operator do exerciseCmd profileCid RecordInvestment with investmentAmount = 300_000.0
+  c1 <- submit f.operator do exerciseCmd p2 GetAvailableCapacity
+  assertMsg "after $300k investment, capacity should be $200k" (c1 == 200_000.0)
+
+  p3 <- submit f.operator do exerciseCmd p2 RecordRedemption with redemptionAmount = 100_000.0
+  c2 <- submit f.operator do exerciseCmd p3 GetAvailableCapacity
+  assertMsg "after $100k redemption, capacity should be $300k" (c2 == 300_000.0)

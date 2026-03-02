@@ -1,7 +1,242 @@
 -- | Asset-Based Lending (ABL) loan lifecycle.
--- Covers loan application, lender commitment, funding, servicing, and repayment.
+--
+-- Covers five stages of the loan pipeline:
+--
+-- @
+--   LoanApplication
+--       │ IssueCommitment (lender)   │ RejectApplication (lender)
+--       │ WithdrawApplication (borrower)
+--       ▼
+--   LoanCommitment
+--       │ AcceptCommitment (borrower) — perfects lien
+--       │ DeclineCommitment (borrower)
+--       │ RevokeCommitment (lender)
+--       ▼
+--   ActiveLoan
+--       │ RecordPayment (lender)          — partial amortisation
+--       │ RecordFullRepayment (lender)    — final payment + lien release
+--       │ DeclareDefault (lender)         — collateral liquidation
+-- @
+--
+-- Dependency order: Types → Compliance → CollateralRegistry → LoanOrigination
 module LoanOrigination where
 
+import DA.Date (Date)
 import Types
 import Compliance
 import CollateralRegistry
+
+-- ---------------------------------------------------------------------------
+-- LoanApplication
+-- ---------------------------------------------------------------------------
+
+-- | Initial loan request submitted by the borrower.
+--
+-- The borrower proposes the loan; the lender reviews it and either issues
+-- a @LoanCommitment@ (term sheet) or rejects the application.
+template LoanApplication
+  with
+    operator          : Operator
+    lender            : Lender
+    borrower          : Borrower
+    loanId            : LoanId     -- ^ Platform-assigned reference, e.g. "ABL-2026-0001"
+    requestedAmount   : Decimal    -- ^ USD principal requested
+    collateralAssetId : AssetId    -- ^ Off-ledger reference to the pledged asset
+    submittedOn       : Date
+  where
+    signatory borrower
+    observer  lender, operator
+
+    ensure requestedAmount > 0.0
+
+    -- | Lender issues a term sheet, advancing the deal to @LoanCommitment@.
+    choice IssueCommitment : ContractId LoanCommitment
+      with
+        terms    : LoanTerms
+        issuedOn : Date
+      controller lender
+      do
+        assertMsg "IssueCommitment: principal must be positive"
+          (terms.principal > 0.0)
+        assertMsg "IssueCommitment: interest rate must be a valid proportion"
+          (isValidRate terms.annualInterestRate)
+        assertMsg "IssueCommitment: max LTV must be a valid proportion"
+          (isValidLTV terms.maxLTV)
+        assertMsg "IssueCommitment: maturity must be after origination"
+          (terms.maturityDate > terms.originationDate)
+        create LoanCommitment with
+          operator = operator
+          lender   = lender
+          borrower = borrower
+          loanId   = loanId
+          terms    = terms
+          issuedOn = issuedOn
+
+    -- | Lender rejects the application — archives with no further action.
+    choice RejectApplication : ()
+      controller lender
+      do return ()
+
+    -- | Borrower withdraws before the lender has reviewed.
+    choice WithdrawApplication : ()
+      controller borrower
+      do return ()
+
+-- ---------------------------------------------------------------------------
+-- LoanCommitment
+-- ---------------------------------------------------------------------------
+
+-- | Lender-issued term sheet awaiting borrower acceptance.
+--
+-- Signatory is the lender, so exercising @AcceptCommitment@ (controlled by
+-- borrower) runs with combined lender + borrower authority — enabling
+-- on-chain lien perfection and creation of the bilateral @ActiveLoan@.
+template LoanCommitment
+  with
+    operator : Operator
+    lender   : Lender
+    borrower : Borrower
+    loanId   : LoanId
+    terms    : LoanTerms
+    issuedOn : Date
+  where
+    signatory lender
+    observer  borrower, operator
+
+    ensure terms.principal > 0.0 &&
+           isValidRate terms.annualInterestRate &&
+           isValidLTV  terms.maxLTV &&
+           terms.maturityDate > terms.originationDate
+
+    -- | Borrower accepts the term sheet.
+    --
+    -- This choice runs with lender + borrower authority, which allows:
+    -- 1. Calling @PerfectLien@ on the @CollateralAsset@ (lender controls it).
+    -- 2. Creating @ActiveLoan@ with both as signatories.
+    --
+    -- Returns @(ContractId ActiveLoan, ContractId CollateralAsset)@ so the
+    -- caller has the live encumbered CID for subsequent lien operations.
+    choice AcceptCommitment : (ContractId ActiveLoan, ContractId CollateralAsset)
+      with
+        collateralCid : ContractId CollateralAsset    -- ^ Asset to encumber
+        borrowerKycId : ContractId ParticipantKYC     -- ^ Borrower's KYC (for lien gate)
+      controller borrower
+      do
+        -- Encumber the collateral — lender authority delegated from this contract.
+        encCid <- exercise collateralCid PerfectLien with
+          forLoanId     = loanId
+          borrowerKycId = borrowerKycId
+        -- Fund the loan — bilateral contract created with full principal outstanding.
+        activeCid <- create ActiveLoan with
+          operator           = operator
+          lender             = lender
+          borrower           = borrower
+          loanId             = loanId
+          terms              = terms
+          outstandingBalance = terms.principal
+        return (activeCid, encCid)
+
+    -- | Borrower declines the term sheet — archives without funding.
+    choice DeclineCommitment : ()
+      controller borrower
+      do return ()
+
+    -- | Lender revokes the term sheet before the borrower has accepted.
+    choice RevokeCommitment : ()
+      controller lender
+      do return ()
+
+-- ---------------------------------------------------------------------------
+-- ActiveLoan
+-- ---------------------------------------------------------------------------
+
+-- | A fully funded ABL loan in active servicing.
+--
+-- Both lender and borrower are signatories — the loan is a bilateral
+-- obligation. The lender (acting as servicer) records all payments
+-- and lien actions.
+template ActiveLoan
+  with
+    operator           : Operator
+    lender             : Lender
+    borrower           : Borrower
+    loanId             : LoanId
+    terms              : LoanTerms
+    outstandingBalance : Decimal   -- ^ Remaining unpaid principal in USD
+  where
+    signatory lender, borrower
+    observer  operator
+
+    -- Outstanding balance must be positive and never exceed face value.
+    ensure outstandingBalance > 0.0 &&
+           outstandingBalance <= terms.principal
+
+    -- ---------------------------------------------------------------------------
+    -- Payment servicing
+    -- ---------------------------------------------------------------------------
+
+    -- | Record a partial principal/interest payment.
+    --
+    -- The remaining balance after this payment must still be positive;
+    -- use @RecordFullRepayment@ for the final payment.
+    choice RecordPayment : ContractId ActiveLoan
+      with
+        paymentAmount : Decimal  -- ^ USD amount applied to outstanding balance
+      controller lender
+      do
+        assertMsg "RecordPayment: payment must be positive"
+          (paymentAmount > 0.0)
+        assertMsg "RecordPayment: payment must be less than outstanding balance; use RecordFullRepayment for final payment"
+          (paymentAmount < outstandingBalance)
+        create this with
+          outstandingBalance = outstandingBalance - paymentAmount
+
+    -- | Record the final payment that zeroes the balance and release the lien.
+    --
+    -- The @finalPayment@ must exactly match the @outstandingBalance@.
+    -- Exercises @ReleaseLien@ on the collateral asset using lender's authority
+    -- (lender is signatory of @ActiveLoan@).
+    choice RecordFullRepayment : ContractId CollateralAsset
+      with
+        finalPayment  : Decimal                      -- ^ Must equal outstandingBalance
+        collateralCid : ContractId CollateralAsset   -- ^ Encumbered asset to release
+      controller lender
+      do
+        assertMsg "RecordFullRepayment: payment must equal outstanding balance"
+          (finalPayment == outstandingBalance)
+        exercise collateralCid ReleaseLien
+
+    -- ---------------------------------------------------------------------------
+    -- Default
+    -- ---------------------------------------------------------------------------
+
+    -- | Declare a default and liquidate the collateral.
+    --
+    -- Valid on any active loan regardless of outstanding balance.
+    -- The lender records the liquidation proceeds from the off-ledger asset sale.
+    choice DeclareDefault : ContractId CollateralAsset
+      with
+        collateralCid       : ContractId CollateralAsset
+        liquidationProceeds : Decimal
+      controller lender
+      do
+        exercise collateralCid LiquidateAsset with
+          liquidationProceeds = liquidationProceeds
+
+    -- ---------------------------------------------------------------------------
+    -- LTV covenant monitoring (nonconsuming)
+    -- ---------------------------------------------------------------------------
+
+    -- | Query the current LTV ratio and whether it breaches the covenant ceiling.
+    --
+    -- Returns @(currentLTV, isWithinCovenant)@.
+    -- Fetches the latest appraisal from the @CollateralAsset@ contract so the
+    -- result reflects any interim re-valuations.
+    nonconsuming choice GetLTVStatus : (Decimal, Bool)
+      with
+        collateralCid : ContractId CollateralAsset
+      controller lender
+      do
+        asset <- fetch collateralCid
+        let currentLTV = computeLTV outstandingBalance asset.assetInfo.appraisedValue
+        return (currentLTV, currentLTV <= terms.maxLTV)
