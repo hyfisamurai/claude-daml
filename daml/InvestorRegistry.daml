@@ -1,6 +1,220 @@
 -- | Accredited investor onboarding and Reg D 506(c) subscription management.
+--
 -- Works in tandem with Compliance to gate all secondary market participation.
+-- Two-template design:
+--
+-- @
+--   OnboardingRequest  (signatory: investor)
+--       │ ApproveOnboarding (operator) — verifies accreditation, creates InvestorProfile
+--       │ RejectOnboarding  (operator)
+--       │ WithdrawRequest   (investor)
+--       ▼
+--   InvestorProfile  (signatory: operator)
+--       │ RecordInvestment   (operator) — tracks token purchases
+--       │ RecordRedemption   (operator) — tracks token redemptions
+--       │ UpdateInvestmentLimit (operator) — adjust subscription cap
+--       │ DeactivateProfile  (operator) — suspends participation
+--       │ ReactivateProfile  (operator) — restores participation
+--       └ VerifyEligibility  (nonconsuming, operator) — pre-trade eligibility check
+-- @
+--
+-- Dependency order: Types → Compliance → InvestorRegistry
 module InvestorRegistry where
 
+import DA.Date (Date)
 import Types
 import Compliance
+
+-- ---------------------------------------------------------------------------
+-- OnboardingRequest
+-- ---------------------------------------------------------------------------
+
+-- | Investor-initiated on-chain request to join the platform.
+--
+-- The investor submits this after completing off-ledger ID verification.
+-- The operator then issues @ParticipantKYC@ and @InvestorAccreditation@
+-- via the Compliance module, then approves this request to create
+-- the investor's @InvestorProfile@.
+template OnboardingRequest
+  with
+    operator     : Operator
+    investor     : Investor
+    investorName : Text
+    tier         : AccreditationTier  -- ^ Self-declared tier; operator verifies off-ledger
+    requestedMax : Decimal            -- ^ Requested maximum investment limit in USD
+    submittedOn  : Date
+  where
+    signatory investor
+    observer  operator
+
+    ensure requestedMax > 0.0
+
+    -- | Operator approves the onboarding, creates an @InvestorProfile@.
+    --
+    -- Validates that the supplied @InvestorAccreditation@ was issued to
+    -- this investor. The approved limit may differ from the requested max.
+    choice ApproveOnboarding : ContractId InvestorProfile
+      with
+        accreditationCid : ContractId InvestorAccreditation
+        approvedMax      : Decimal  -- ^ Platform-set investment cap (USD)
+      controller operator
+      do
+        accred <- fetch accreditationCid
+        assertMsg "ApproveOnboarding: accreditation must belong to this investor"
+          (accred.investor == investor)
+        assertMsg "ApproveOnboarding: approved limit must be positive"
+          (approvedMax > 0.0)
+        create InvestorProfile with
+          operator           = operator
+          investor           = investor
+          investorName       = investorName
+          tier               = tier
+          accreditationCid   = accreditationCid
+          maxInvestmentLimit = approvedMax
+          currentInvestment  = 0.0
+          isActive           = True
+
+    -- | Operator rejects the request — archives with no profile created.
+    choice RejectOnboarding : ()
+      controller operator
+      do return ()
+
+    -- | Investor withdraws the request before the operator acts.
+    choice WithdrawRequest : ()
+      controller investor
+      do return ()
+
+-- ---------------------------------------------------------------------------
+-- InvestorProfile
+-- ---------------------------------------------------------------------------
+
+-- | On-ledger record of an onboarded accredited investor.
+--
+-- Tracks the investor's subscription cap and cumulative investment to
+-- enforce Reg D limits. The operator updates this record each time the
+-- investor purchases or redeems tokens (coordinated with the LoanToken module).
+--
+-- Other modules (LoanToken, SecondaryMarket) should @fetch@ this record
+-- and assert @isActive == True@ before allowing a trade. The operator
+-- separately calls @RecordInvestment@ / @RecordRedemption@ to keep
+-- the totals in sync as part of the settlement workflow.
+template InvestorProfile
+  with
+    operator           : Operator
+    investor           : Investor
+    investorName       : Text
+    tier               : AccreditationTier
+    accreditationCid   : ContractId InvestorAccreditation  -- ^ Live Reg D accreditation
+    maxInvestmentLimit : Decimal   -- ^ Platform-set subscription cap in USD
+    currentInvestment  : Decimal   -- ^ Cumulative USD invested across all tokens
+    isActive           : Bool      -- ^ False when compliance hold is in effect
+  where
+    signatory operator
+    observer  investor
+
+    ensure maxInvestmentLimit > 0.0 &&
+           currentInvestment  >= 0.0 &&
+           currentInvestment  <= maxInvestmentLimit
+
+    -- ---------------------------------------------------------------------------
+    -- Subscription tracking
+    -- ---------------------------------------------------------------------------
+
+    -- | Record a token purchase — increases @currentInvestment@.
+    --
+    -- Fails if the profile is inactive or if the new total would exceed
+    -- the subscription cap.
+    choice RecordInvestment : ContractId InvestorProfile
+      with
+        investmentAmount : Decimal
+      controller operator
+      do
+        assertMsg "RecordInvestment: investor profile is not active"
+          isActive
+        assertMsg "RecordInvestment: investment amount must be positive"
+          (investmentAmount > 0.0)
+        assertMsg "RecordInvestment: would exceed maximum investment limit"
+          (currentInvestment + investmentAmount <= maxInvestmentLimit)
+        create this with
+          currentInvestment = currentInvestment + investmentAmount
+
+    -- | Record a token redemption — decreases @currentInvestment@.
+    --
+    -- Permits redemptions even when the profile is inactive (the investor
+    -- should always be able to exit a position).
+    choice RecordRedemption : ContractId InvestorProfile
+      with
+        redemptionAmount : Decimal
+      controller operator
+      do
+        assertMsg "RecordRedemption: redemption amount must be positive"
+          (redemptionAmount > 0.0)
+        assertMsg "RecordRedemption: redemption exceeds current investment"
+          (redemptionAmount <= currentInvestment)
+        create this with
+          currentInvestment = currentInvestment - redemptionAmount
+
+    -- ---------------------------------------------------------------------------
+    -- Profile management
+    -- ---------------------------------------------------------------------------
+
+    -- | Update the investor's maximum investment limit.
+    --
+    -- The new limit may not be set below the current outstanding investment.
+    choice UpdateInvestmentLimit : ContractId InvestorProfile
+      with
+        newMax : Decimal
+      controller operator
+      do
+        assertMsg "UpdateInvestmentLimit: new limit must be positive"
+          (newMax > 0.0)
+        assertMsg "UpdateInvestmentLimit: new limit cannot be below current investment"
+          (newMax >= currentInvestment)
+        create this with maxInvestmentLimit = newMax
+
+    -- | Deactivate the investor profile.
+    --
+    -- Blocks new investments while allowing redemptions (investor can exit).
+    -- Typical triggers: KYC revocation, compliance hold, or expired accreditation.
+    choice DeactivateProfile : ContractId InvestorProfile
+      controller operator
+      do
+        assertMsg "DeactivateProfile: profile is already inactive" isActive
+        create this with isActive = False
+
+    -- | Reactivate a deactivated profile after the compliance issue is resolved.
+    choice ReactivateProfile : ContractId InvestorProfile
+      controller operator
+      do
+        assertMsg "ReactivateProfile: profile is already active" (not isActive)
+        create this with isActive = True
+
+    -- ---------------------------------------------------------------------------
+    -- Pre-trade eligibility check (nonconsuming)
+    -- ---------------------------------------------------------------------------
+
+    -- | Verify whether the investor is eligible for a new investment.
+    --
+    -- Returns @True@ iff all three conditions hold:
+    -- 1. Profile is active.
+    -- 2. The linked accreditation has not expired as of @asOfDate@.
+    -- 3. The proposed @investmentAmount@ fits within the remaining capacity.
+    --
+    -- Designed to be called by the operator as a pre-trade compliance gate
+    -- before settling a token purchase in the LoanToken or SecondaryMarket module.
+    nonconsuming choice VerifyEligibility : Bool
+      with
+        investmentAmount : Decimal
+        asOfDate         : Date
+      controller operator
+      do
+        accred <- fetch accreditationCid
+        let accredValid = accred.expiryDate >= asOfDate
+        let hasCapacity = currentInvestment + investmentAmount <= maxInvestmentLimit
+        return (isActive && accredValid && hasCapacity)
+
+    -- | Return the remaining investment capacity in USD.
+    nonconsuming choice GetAvailableCapacity : Decimal
+      controller operator
+      do
+        return (maxInvestmentLimit - currentInvestment)
