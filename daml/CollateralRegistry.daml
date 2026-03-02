@@ -1,0 +1,7 @@
+-- | Hard asset collateral registration and lien management.
+-- Records pledged assets (real estate, equipment, fleet, etc.),
+-- third-party appraisals, LTV calculations, and lender lien perfection.
+module CollateralRegistry where
+
+import Types
+import Compliance

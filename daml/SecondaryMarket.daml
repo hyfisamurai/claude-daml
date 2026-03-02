@@ -1,0 +1,8 @@
+-- | Reg D secondary marketplace for fractional loan tokens.
+-- Handles listings, bids, order matching, and atomic DVP settlement on Canton Network.
+module SecondaryMarket where
+
+import Types
+import Compliance
+import InvestorRegistry
+import LoanToken

@@ -1,0 +1,6 @@
+-- | Cross-cutting KYC/AML compliance layer.
+-- Maintains the canonical whitelist of cleared parties and Reg D accreditation status.
+-- Every transfer choice in every other module must verify membership here.
+module Compliance where
+
+import Types

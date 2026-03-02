@@ -1,0 +1,27 @@
+# Daml build artifacts — never commit these
+.daml/
+*.dar
+
+# Codegen output (TypeScript / Java)
+ui/src/daml.js
+ui/node_modules/
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Environment / secrets — never commit
+.env
+.env.*
+secrets/
