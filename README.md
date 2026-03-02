@@ -174,108 +174,121 @@ The contract system is organized as a **hierarchy of composable modules**, each 
 
 ## 5. Smart Contract Module Reference
 
+### `Types.daml` — Shared Foundation
+**Responsibility:** Defines all shared types, enums, and pure utility functions. Has no dependencies on other project modules — everything else imports from here.
+
+Key types: `CollateralAssetType`, `AssetStatus`, `LoanStatus`, `PaymentFrequency`, `KYCStatus`, `AccreditationTier`, `TokenStatus`, `ListingStatus`, `LoanTerms`, `CollateralInfo`, `TokenTranche`
+
+Key utilities: `calculateDailyInterest`, `computeLTV`, `isValidRate`, `isValidLTV`, `loanDurationDays`, `proRataShare`
+
+---
+
 ### `Compliance.daml` — Cross-Cutting Compliance Layer
-**Responsibility:** Maintains the canonical whitelist of KYC/AML-cleared parties and Reg D accreditation status. Every transfer choice in every other module must verify membership here.
+**Responsibility:** Maintains the canonical whitelist of KYC/AML-cleared parties and Reg D accreditation status. Every transfer choice in every other module fetches from here before proceeding.
 
 Key templates:
-- `ComplianceRegistry` — operator-controlled registry of cleared participants
-- `KYCRecord` — per-party KYC status, accreditation proof, and jurisdiction
-- `AccreditedInvestorAttestation` — signed Reg D 506(c) self-certification with expiry
+- `ParticipantKYC` — operator-controlled KYC record per party; lifecycle: `KYCPending` → `KYCApproved` ↔ `KYCSuspended`; `RevokeKYC` archives
+- `InvestorAccreditation` — Reg D 506(c) attestation with expiry; operator-issued per investor
 
-Key choices:
-- `AddKYCRecord` — operator adds or updates a party's compliance record
-- `RevokeKYCRecord` — operator removes a party (e.g., sanctions hit)
-- `AttestAccreditation` — investor self-attests accredited status (506(c))
+Key choices on `ParticipantKYC`:
+- `ApproveKYC` — pending → approved
+- `SuspendKYC` — approved → suspended
+- `ReinstatKYC` — suspended → approved
+- `RevokeKYC` — permanently archives the record
+
+Key choices on `InvestorAccreditation`:
+- `RenewAccreditation` — extend expiry (must be forward-only)
+- `RevokeAccreditation` — archives the record
 
 ---
 
 ### `CollateralRegistry.daml` — Layer 1: Hard Asset Registration
-**Responsibility:** Creates and maintains the on-chain record of pledged hard assets, their appraised values, and the senior lien held by the lender.
+**Responsibility:** Creates and maintains the on-chain record of pledged hard assets, their appraised values, and the senior lien held by the lender. Operator acts as the title registry; lender controls lien lifecycle.
 
 Key templates:
-- `CollateralAsset` — a registered hard asset (type, description, appraisal, lien)
-- `AppraisalRecord` — timestamped third-party appraisal linked to `CollateralAsset`
-- `LienRecord` — lender's perfected security interest against a `CollateralAsset`
+- `CollateralAsset` — a registered hard asset (type, description, appraisal, lien status)
 
 Key choices:
-- `RegisterAsset` — lender registers a new collateral asset on-chain
-- `UpdateAppraisal` — certified appraiser posts a new valuation
-- `PerfectLien` — lender records the senior secured lien post-closing
-- `ReleaseLien` — lender releases lien upon loan repayment
-- `nonconsuming QueryLTV` — compute current loan-to-value ratio
+- `UpdateAppraisal` (operator) — post a new certified valuation; asset must be Registered or Encumbered
+- `PerfectLien` (lender) — Registered → Encumbered; fetches borrower `ParticipantKYC` on-chain as a compliance gate
+- `ReleaseLien` (lender) — Encumbered → Released on full repayment
+- `LiquidateAsset` (lender) — Encumbered → Liquidated on default; records proceeds
+- `nonconsuming GetCurrentLTV` (lender) — compute current loan-to-value ratio
 
 ---
 
 ### `LoanOrigination.daml` — Layer 2: ABL Loan Lifecycle
-**Responsibility:** Models the full lifecycle of an asset-based loan from term sheet through funding, servicing, and repayment.
+**Responsibility:** Models the full lifecycle of an asset-based loan from application through funding, servicing, and closure.
 
 Key templates:
-- `LoanApplication` — borrower-submitted loan request with collateral schedule
-- `LoanCommitment` — lender-approved term sheet (rate, LTV, maturity, covenants)
-- `ActiveLoan` — funded loan with payment schedule, outstanding balance, and linked collateral
+- `LoanApplication` — borrower-initiated loan request
+- `LoanCommitment` — lender-issued term sheet; lender is signatory, enabling combined authority on acceptance
+- `ActiveLoan` — funded bilateral loan (signatory: lender + borrower)
 
 Key choices:
-- `ApproveApplication` — lender approves and issues a `LoanCommitment`
-- `AcceptCommitment` — borrower accepts terms, triggers funding
-- `RecordPayment` — servicer posts a principal + interest payment
-- `DeclareDefault` — lender triggers default clause (LTV breach, missed payment)
-- `nonconsuming QueryOutstandingBalance` — read current balance without mutation
+- `IssueCommitment` (lender on `LoanApplication`) — validates terms, creates `LoanCommitment`
+- `AcceptCommitment` (borrower on `LoanCommitment`) — runs with lender+borrower authority; calls `PerfectLien` atomically; creates `ActiveLoan`; returns `(ContractId ActiveLoan, ContractId CollateralAsset)`
+- `RejectApplication` / `WithdrawApplication` / `DeclineCommitment` / `RevokeCommitment` — lifecycle exits
+- `RecordPayment` (lender on `ActiveLoan`) — partial payment; balance must stay positive
+- `RecordFullRepayment` (lender) — final payment must equal outstanding; calls `ReleaseLien`
+- `DeclareDefault` (lender) — calls `LiquidateAsset` on collateral
+- `nonconsuming GetLTVStatus` (lender) — returns `(currentLTV, isWithinCovenant)`
 
 ---
 
 ### `InvestorRegistry.daml` — Layer 2: Accredited Investor Onboarding
-**Responsibility:** Maintains the register of verified accredited investors eligible to purchase Reg D securities. Works in tandem with `Compliance.daml`.
+**Responsibility:** Maintains the register of verified accredited investors and enforces subscription limits. Works in tandem with `Compliance.daml`.
 
 Key templates:
-- `InvestorProfile` — verified investor identity, accreditation tier, and investment limits
-- `InvestorWallet` — investor's on-chain token wallet linked to their verified profile
-- `SubscriptionAgreement` — signed Reg D subscription document on-chain
+- `OnboardingRequest` — investor-initiated two-party onboarding proposal
+- `InvestorProfile` — operator-managed profile tracking subscription cap and cumulative investment
 
-Key choices:
-- `OnboardInvestor` — operator creates a verified `InvestorProfile` after KYC
-- `UpdateAccreditationTier` — adjust investor's accreditation classification
-- `SignSubscriptionAgreement` — investor executes Reg D docs on-chain
-- `SuspendInvestor` — freeze an investor wallet (sanctions, regulatory hold)
+Key choices on `OnboardingRequest`:
+- `ApproveOnboarding` (operator) — validates `InvestorAccreditation` ownership; creates `InvestorProfile`
+- `RejectOnboarding` / `WithdrawRequest` — lifecycle exits
+
+Key choices on `InvestorProfile`:
+- `RecordInvestment` (operator) — increases `currentInvestment`; guards active status and capacity
+- `RecordRedemption` (operator) — decreases `currentInvestment`; always permitted (investor can exit)
+- `UpdateInvestmentLimit` (operator) — adjust cap; cannot go below current investment
+- `DeactivateProfile` / `ReactivateProfile` (operator) — compliance hold toggle
+- `nonconsuming VerifyEligibility` (operator) — returns `Bool`; checks active + accreditation not expired + capacity
+- `nonconsuming GetAvailableCapacity` (operator) — returns `maxLimit - currentInvestment`
 
 ---
 
 ### `LoanToken.daml` — Layer 3: Fractional Token Issuance & Yield
-**Responsibility:** Mints fractional digital securities representing beneficial ownership in an `ActiveLoan`. Enforces compliance on every transfer. Distributes yield on-chain.
+**Responsibility:** Mints fractional digital securities representing beneficial ownership in an `ActiveLoan`. Enforces compliance on every transfer. Computes yield on-chain.
 
 Key templates:
-- `LoanTokenIssuance` — the authority record authorizing a token tranche
-- `LoanToken` — a fractional token held by an accredited investor
-- `YieldAccrual` — per-token accrued interest record (updated by servicer)
-- `YieldDistribution` — snapshot of a yield payment event
+- `TokenIssuance` — lender+operator authority record for a token tranche; nonconsuming `MintAllocation` mints per-investor tokens
+- `IssuedToken` — a fractional token held by an accredited investor
 
-Key choices:
-- `MintTokenTranche` — lender mints tokens against a funded `ActiveLoan`
-- `Transfer` — transfer tokens between whitelisted investors (compliance-gated)
-- `AccrueYield` — servicer posts accrued interest to `YieldAccrual` records
-- `ClaimYield` — investor claims their proportional yield share
-- `RedeemAtMaturity` — redeem tokens for principal upon loan repayment
-- `nonconsuming QueryAccruedYield` — read accrued yield without side effects
+Key choices on `IssuedToken`:
+- `Transfer` (lender) — compliance-gated: fetches receiver `ParticipantKYC` (must be `KYCApproved`) and `InvestorProfile` (must be active); partial transfers produce a residual token; returns `(ContractId IssuedToken, Optional (ContractId IssuedToken))`
+- `FreezeToken` / `UnfreezeToken` (lender) — compliance hold; frozen tokens block transfer and redemption
+- `nonconsuming AccrueYield` (lender) — returns USD yield for a date range via simple interest
+- `RedeemToken` (lender) — Active only; computes pro-rata principal proceeds; archives token
 
-> **Compliance gate (enforced in `Transfer`):** Every token transfer calls `nonconsuming QueryKYCStatus` on `ComplianceRegistry` for both sender and receiver. If either party fails the check, the choice aborts — identical to how BENJI enforces compliance at the protocol level.
+> **Compliance gate (enforced in `Transfer` and `MintAllocation`):** Both choices fetch the receiver's `ParticipantKYC` and `InvestorProfile` on-chain and abort if either check fails — identical to how BENJI enforces compliance at the protocol level.
 
 ---
 
 ### `SecondaryMarket.daml` — Layer 4: Reg D Marketplace
-**Responsibility:** Operates the on-chain secondary market where accredited investors list, discover, and settle fractional loan tokens via atomic DVP on Canton.
+**Responsibility:** Operates the on-chain secondary market where accredited investors list and settle fractional loan tokens via atomic DVP on Canton.
 
 Key templates:
-- `TokenListing` — a sell-side offer: token amount, ask price, expiry, seller identity
-- `PurchaseOrder` — a buy-side intent: token amount, bid price, buyer identity
-- `MatchedTrade` — a matched order awaiting atomic DVP settlement
-- `SettledTrade` — immutable record of a completed secondary market transaction
+- `TokenListing` — seller's offer: token amount, ask price, expiry (signatory: seller + lender)
+- `TradeRecord` — immutable audit trail of a settled trade (signatory: lender, observer: operator + seller + buyer)
 
-Key choices:
-- `ListTokens` — investor lists tokens for sale (compliance-verified)
-- `PlaceBid` — buyer places a purchase order (compliance-verified)
-- `MatchOrders` — market operator matches compatible listings and orders
-- `SettleTrade` — atomic: transfer token to buyer, transfer cash to seller, record `SettledTrade`
-- `CancelListing` — seller withdraws an open listing
-- `nonconsuming QueryMarketDepth` — read open listings without mutation
+Key choices on `TokenListing`:
+- `MatchListing` (lender) — atomic DVP: compliance gate (buyer KYC + profile) → `IssuedToken.Transfer` → creates `TradeRecord`; returns `(ContractId TradeRecord, ContractId IssuedToken, Optional (ContractId IssuedToken))`
+- `CancelListing` (seller) — withdraw before match
+- `RevokeListing` (lender) — compliance-driven cancellation
+- `ExpireListing` (lender) — clear stale listings
+
+Key choices on `TradeRecord`:
+- `PurgeRecord` (operator) — archive after regulatory retention period
 
 ---
 
@@ -283,38 +296,55 @@ Key choices:
 
 ```
 Step 1 — COLLATERAL REGISTRATION
-  Business submits hard assets → Lender calls RegisterAsset on CollateralRegistry
-  Appraiser calls UpdateAppraisal → Lender calls PerfectLien
+  Operator creates CollateralAsset with initial appraisal
+  Operator calls UpdateAppraisal → posts certified valuation (status: AssetRegistered)
+  [Lender will call PerfectLien in Step 2 as part of AcceptCommitment]
 
 Step 2 — LOAN ORIGINATION
-  Business calls createCmd LoanApplication
-  Lender calls ApproveApplication → issues LoanCommitment
-  Business calls AcceptCommitment → ActiveLoan created, capital disbursed
+  Borrower calls createCmd LoanApplication with proposed terms + collateral ref
+  Lender calls IssueCommitment (on LoanApplication) → LoanCommitment created
+  Borrower calls AcceptCommitment (on LoanCommitment) with collateralCid + borrowerKycId
+    → atomically calls PerfectLien (CollateralAsset: Registered → Encumbered)
+    → creates ActiveLoan (signatory: lender + borrower)
+    → returns (ContractId ActiveLoan, ContractId CollateralAsset)
+  Capital disbursed off-chain; lender begins servicing
 
-Step 3 — INVESTOR ONBOARDING (parallel, one-time per investor)
-  Operator calls OnboardInvestor (after KYC/AML)
-  Investor calls AttestAccreditation (Reg D 506(c))
-  Investor calls SignSubscriptionAgreement
+Step 3 — INVESTOR ONBOARDING (one-time per investor, can run in parallel)
+  Operator creates ParticipantKYC for investor → calls ApproveKYC
+  Operator creates InvestorAccreditation (Reg D 506(c)) with expiry date
+  Investor creates OnboardingRequest
+  Operator calls ApproveOnboarding (on OnboardingRequest) → InvestorProfile created
+  Operator calls RecordInvestment (on InvestorProfile) as tokens are purchased
 
 Step 4 — TOKENIZATION
-  Lender calls MintTokenTranche on LoanToken → LoanTokens minted
-  Lender calls ListTokens on SecondaryMarket → TokenListings created
+  Lender + Operator create TokenIssuance record against ActiveLoan
+  Lender calls MintAllocation (nonconsuming, per investor) → IssuedToken created per allocation
+  Seller (token holder) + Lender co-sign createCmd TokenListing → listing posted on secondary market
 
-Step 5 — SECONDARY MARKET TRADING
-  Investors call PlaceBid → PurchaseOrders created
-  Operator calls MatchOrders → MatchedTrades created
-  Operator calls SettleTrade → atomic DVP: tokens → buyers, cash → lender
-  Lender's capital is recycled → funds next loan
+Step 5 — SECONDARY MARKET TRADING (Reg D DVP)
+  Lender calls MatchListing (on TokenListing) with buyer + buyerKycId + buyerProfileId
+    → compliance gate: fetches + asserts buyer ParticipantKYC (must be KYCApproved)
+    → compliance gate: fetches + asserts buyer InvestorProfile (must be active)
+    → exercises IssuedToken.Transfer → buyer receives token; seller retains residual (if partial)
+    → creates TradeRecord (immutable audit trail)
+    → returns (ContractId TradeRecord, ContractId IssuedToken, Optional (ContractId IssuedToken))
+  Lender's capital is recycled off-chain → funds next ABL loan
 
 Step 6 — ONGOING SERVICING & YIELD
-  Borrower makes monthly payments → Servicer calls RecordPayment
-  Servicer calls AccrueYield on each LoanToken
-  Investors call ClaimYield → 3% annualized distributed proportionally
+  Borrower makes periodic payments → Lender calls RecordPayment (on ActiveLoan)
+  Lender calls AccrueYield (nonconsuming, on IssuedToken) per investor per period
+    → returns USD yield = investorYield × tokenFaceValue × tokenAmount × (days/365)
+  Yield settled off-chain or via separate payment contract
+  Lender calls nonconsuming GetLTVStatus → monitors covenant (triggers margin call if needed)
 
 Step 7 — LOAN MATURITY / REPAYMENT
-  Borrower repays principal → Servicer calls RecordPayment (final)
-  Investors call RedeemAtMaturity → principal returned pro-rata
-  Lender calls ReleaseLien → collateral returned to borrower
+  Borrower makes final payment → Lender calls RecordFullRepayment (on ActiveLoan)
+    → exact balance match required
+    → atomically calls ReleaseLien → CollateralAsset: Encumbered → Released
+  Lender calls RedeemToken (on each IssuedToken) per investor
+    → Active tokens only; computes pro-rata principal proceeds
+    → archives IssuedToken (token lifecycle complete)
+  Collateral returned to borrower off-chain
 ```
 
 ---
@@ -327,20 +357,22 @@ All secondary market offerings under this system are structured as **Reg D 506(c
 
 | Requirement | Implementation |
 |-------------|---------------|
-| Accredited investors only | `InvestorRegistry` enforces via `ComplianceRegistry` check |
-| General solicitation allowed | Public listing on secondary market is permitted under 506(c) |
-| Issuer verification of accreditation | `AccreditedInvestorAttestation` signed on-chain |
+| Accredited investors only | `MatchListing` fetches buyer's `InvestorProfile` (must be active); `MintAllocation` fetches receiver's `InvestorProfile` |
+| General solicitation allowed | Public `TokenListing` on secondary market is permitted under 506(c) |
+| Issuer verification of accreditation | `InvestorAccreditation` record signed on-chain by operator; checked in `ApproveOnboarding` |
 | Form D filing within 15 days | Off-chain compliance obligation of the issuer |
-| No resale to non-accredited parties | `Transfer` choice aborts if receiver not in whitelist |
+| No resale to non-accredited parties | `Transfer` on `IssuedToken` fetches receiver `ParticipantKYC` (must be `KYCApproved`) and `InvestorProfile` (must be active); aborts otherwise |
 
 ### KYC / AML
-- Every party (borrower, lender, investor, servicer) must hold an active `KYCRecord` in `ComplianceRegistry`
-- Sanctions screening updates propagate via `RevokeKYCRecord`
-- All transfers are blocked for suspended or revoked parties — enforced at the smart contract level
+- Every party (borrower, lender, investor) must hold an active `ParticipantKYC` record in `Compliance.daml`
+- KYC lifecycle: `KYCPending` → `ApproveKYC` → `KYCApproved` ↔ `SuspendKYC` ↔ `KYCSuspended`; `RevokeKYC` permanently archives the record
+- Sanctions screening updates propagate via `SuspendKYC` (reversible) or `RevokeKYC` (permanent archive)
+- All token transfers are blocked for suspended or revoked parties — enforced as a hard abort in `IssuedToken.Transfer` and `SecondaryMarket.MatchListing`
 
 ### Collateral Lien Perfection
-- On-chain `LienRecord` is a record of the lender's security interest (supplements, does not replace, UCC-1 filings)
-- LTV covenant monitoring via `nonconsuming QueryLTV` — enables automated margin call triggers
+- `CollateralAsset` (in `CollateralRegistry.daml`) is the on-chain record of the lender's security interest; supplements (does not replace) UCC-1 filings
+- `PerfectLien` transitions the asset from `AssetRegistered` → `AssetEncumbered`, associating it with a `LoanId`
+- LTV covenant monitoring via `nonconsuming GetCurrentLTV` (on `CollateralAsset`) and `nonconsuming GetLTVStatus` (on `ActiveLoan`) — enables automated margin call triggers
 
 ---
 
@@ -420,7 +452,8 @@ claude-daml/
     ├── LoanOriginationTest.daml    # 22 tests — loan pipeline, LTV, defaults
     ├── InvestorRegistryTest.daml   # 24 tests — onboarding, limits, eligibility
     ├── LoanTokenTest.daml          # 24 tests — issuance, transfer, yield, freeze
-    └── SecondaryMarketTest.daml    # 22 tests — DVP, compliance gate, audit trail
+    ├── SecondaryMarketTest.daml    # 22 tests — DVP, compliance gate, audit trail
+    └── E2ETest.daml                # 1 test  — full lifecycle integration (all 7 modules)
 ```
 
 ---
@@ -437,11 +470,12 @@ claude-daml/
 | 5 | `InvestorRegistry.daml` — `OnboardingRequest` + `InvestorProfile` subscription tracking | ✅ Complete | 24 |
 | 6 | `LoanToken.daml` — `IssuedToken` compliance-gated transfer, yield accrual, redemption | ✅ Complete | 24 |
 | 7 | `SecondaryMarket.daml` — `TokenListing` + `TradeRecord` atomic DVP settlement | ✅ Complete | 22 |
+| 7a | `E2ETest.daml` — single-script full lifecycle integration test (all 7 modules) | ✅ Complete | 1 |
 | 8 | Canton Network sandbox deployment & integration smoke test | Planned | — |
 | 9 | TypeScript codegen (`daml codegen js`) + React reference UI | Planned | — |
 | 10 | Reg D compliance audit & legal review | Planned | — |
 
-**136 Daml Script tests** pass across all seven source modules (phases 1–7).
+**137 Daml Script tests** pass across all seven source modules (phases 1–7), including one end-to-end integration test spanning the full deal lifecycle.
 
 ### Completed architecture at a glance
 
