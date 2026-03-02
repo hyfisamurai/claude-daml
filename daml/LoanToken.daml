@@ -1,8 +1,241 @@
--- | Fractional loan token issuance, transfer, yield accrual, and redemption.
--- Compliance is enforced on every Transfer choice (KYC gate mirrors BENJI pattern).
+-- | Fractional loan token issuance, compliance-gated transfer, yield accrual,
+-- and maturity redemption.
+--
+-- Design mirrors the BENJI/Franklin Templeton on-chain money-market pattern:
+-- every @Transfer@ fetches the receiver's @ParticipantKYC@ and
+-- @InvestorProfile@ on-chain before moving tokens, making compliance a
+-- hard ledger invariant rather than an off-chain control.
+--
+-- Token lifecycle:
+--
+-- @
+--   IssuedToken  (lender mints tranche against a funded ActiveLoan)
+--       │ Transfer (lender, compliance-gated) — peer-to-peer secondary move
+--       │ AccrueYield (lender, nonconsuming)  — compute yield earned
+--       │ FreezeToken (lender)                — compliance hold
+--       │ UnfreezeToken (lender)              — lift compliance hold
+--       │ RedeemToken (lender)                — maturity or early redemption
+-- @
+--
+-- Dependency order: Types → Compliance → LoanOrigination → InvestorRegistry → LoanToken
 module LoanToken where
 
+import DA.Date (Date)
 import Types
 import Compliance
 import LoanOrigination
 import InvestorRegistry
+
+-- ---------------------------------------------------------------------------
+-- IssuedToken
+-- ---------------------------------------------------------------------------
+
+-- | A fractional claim on a funded ABL loan — the on-ledger token.
+--
+-- The lender (token issuer) is the sole signatory. The investor is
+-- an observer; they gain economic rights (yield, redemption) but
+-- exercise them through the lender acting as transfer agent.
+--
+-- Token amount is denominated in units, where each unit has a face
+-- value of @tranche.tokenFaceValue@ USD at issuance.
+template IssuedToken
+  with
+    operator    : Operator
+    lender      : Lender          -- ^ Issuer and transfer agent
+    investor    : Investor        -- ^ Current token holder
+    loanId      : LoanId          -- ^ Backing loan reference
+    tokenId     : TokenId         -- ^ Unique token tranche identifier
+    tranche     : TokenTranche    -- ^ Economics: totalTokens, faceValue, investorYield
+    tokenAmount : Decimal         -- ^ Units held by this investor
+    issuedOn    : Date            -- ^ Token issuance date
+    status      : TokenStatus     -- ^ Active | Frozen | Redeemed
+  where
+    signatory lender
+    observer  investor, operator
+
+    ensure tokenAmount > 0.0 &&
+           tokenAmount <= tranche.totalTokens &&
+           isValidRate tranche.investorYield &&
+           tranche.tokenFaceValue > 0.0 &&
+           tranche.totalTokens > 0.0 &&
+           status /= TokenRedeemed  -- redeemed tokens are archived, not kept alive
+
+    -- ---------------------------------------------------------------------------
+    -- Transfer (compliance-gated)
+    -- ---------------------------------------------------------------------------
+
+    -- | Transfer tokens to a new investor.
+    --
+    -- On-chain compliance gate (mirrors the BENJI pattern):
+    -- 1. Fetches receiver's @ParticipantKYC@ — must be @KYCApproved@.
+    -- 2. Fetches receiver's @InvestorProfile@ — must be active.
+    -- Archives this contract and creates a new @IssuedToken@ for the receiver.
+    -- A partial transfer creates a residual token for the current holder.
+    choice Transfer : (ContractId IssuedToken, Optional (ContractId IssuedToken))
+      with
+        newInvestor      : Investor
+        transferAmount   : Decimal                        -- ^ Units to transfer
+        receiverKycId    : ContractId ParticipantKYC      -- ^ Receiver's KYC record
+        receiverProfileId : ContractId InvestorProfile    -- ^ Receiver's investor profile
+      controller lender
+      do
+        assertMsg "Transfer: token must be Active" (status == TokenActive)
+        assertMsg "Transfer: transfer amount must be positive" (transferAmount > 0.0)
+        assertMsg "Transfer: cannot transfer more than held amount"
+          (transferAmount <= tokenAmount)
+        -- On-chain KYC gate.
+        kycRecord <- fetch receiverKycId
+        assertMsg "Transfer: receiver KYC must be for the named new investor"
+          (kycRecord.participant == newInvestor)
+        assertMsg "Transfer: receiver must be KYCApproved"
+          (kycRecord.kycStatus == KYCApproved)
+        -- On-chain investor profile gate.
+        profile <- fetch receiverProfileId
+        assertMsg "Transfer: receiver investor profile must be for the named new investor"
+          (profile.investor == newInvestor)
+        assertMsg "Transfer: receiver investor profile must be active"
+          profile.isActive
+        -- Mint receiver's token.
+        receiverCid <- create this with
+          investor    = newInvestor
+          tokenAmount = transferAmount
+          status      = TokenActive
+        -- Residual token for current holder (if partial transfer).
+        residualCid <-
+          if transferAmount < tokenAmount
+            then do
+              cid <- create this with tokenAmount = tokenAmount - transferAmount
+              return (Some cid)
+            else return None
+        return (receiverCid, residualCid)
+
+    -- ---------------------------------------------------------------------------
+    -- Compliance hold
+    -- ---------------------------------------------------------------------------
+
+    -- | Freeze the token — blocks further transfers or redemptions.
+    -- Typical trigger: AML alert, sanctions review, court order.
+    choice FreezeToken : ContractId IssuedToken
+      controller lender
+      do
+        assertMsg "FreezeToken: token must be Active to freeze"
+          (status == TokenActive)
+        create this with status = TokenFrozen
+
+    -- | Lift a compliance freeze — returns token to Active status.
+    choice UnfreezeToken : ContractId IssuedToken
+      controller lender
+      do
+        assertMsg "UnfreezeToken: token must be Frozen to unfreeze"
+          (status == TokenFrozen)
+        create this with status = TokenActive
+
+    -- ---------------------------------------------------------------------------
+    -- Yield accrual (nonconsuming)
+    -- ---------------------------------------------------------------------------
+
+    -- | Compute yield earned by this token holder over a period.
+    --
+    -- Uses simple interest: investorYield × tokenFaceValue × tokenAmount × (days/365).
+    -- Does not modify the contract — yield is settled off-ledger or via
+    -- a separate payment record.
+    nonconsuming choice AccrueYield : Decimal
+      with
+        fromDate : Date   -- ^ Start of accrual period (inclusive)
+        toDate   : Date   -- ^ End of accrual period (exclusive)
+      controller lender
+      do
+        let days = loanDurationDays fromDate toDate
+        let positionValue = tranche.tokenFaceValue * tokenAmount
+        return (calculateDailyInterest positionValue tranche.investorYield days)
+
+    -- ---------------------------------------------------------------------------
+    -- Redemption
+    -- ---------------------------------------------------------------------------
+
+    -- | Redeem the token at maturity or on early redemption.
+    --
+    -- Archives the token contract. The lender settles the redemption
+    -- proceeds (principal × pro-rata share) off-ledger or via a separate
+    -- payment contract. Returns the USD redemption amount for record-keeping.
+    choice RedeemToken : Decimal
+      with
+        redemptionDate : Date   -- ^ Date redemption is processed
+      controller lender
+      do
+        assertMsg "RedeemToken: only Active tokens may be redeemed"
+          (status == TokenActive)
+        -- Pro-rata share of total principal returned to this investor.
+        let share    = proRataShare tokenAmount tranche.totalTokens
+        let proceeds = share * tranche.tokenFaceValue * tranche.totalTokens
+        return proceeds
+
+-- ---------------------------------------------------------------------------
+-- TokenIssuance
+-- ---------------------------------------------------------------------------
+
+-- | Operator-authorised record of a token tranche issuance event.
+--
+-- The lender creates this to mint the initial token distribution against
+-- a funded @ActiveLoan@. Each investor in the initial placement gets an
+-- @IssuedToken@ contract; the @TokenIssuance@ record provides the audit trail.
+template TokenIssuance
+  with
+    operator  : Operator
+    lender    : Lender
+    loanId    : LoanId
+    tokenId   : TokenId
+    tranche   : TokenTranche
+    issuedOn  : Date
+    loanCid   : ContractId ActiveLoan  -- ^ The funded loan backing this tranche
+  where
+    signatory lender, operator
+
+    ensure tranche.totalTokens > 0.0 &&
+           tranche.tokenFaceValue > 0.0 &&
+           isValidRate tranche.investorYield
+
+    -- | Mint a token allocation for a single investor in the initial placement.
+    --
+    -- Validates the investor's KYC and profile before minting.
+    -- May be called multiple times (once per investor in the syndication).
+    nonconsuming choice MintAllocation : ContractId IssuedToken
+      with
+        investor         : Investor
+        allocationAmount : Decimal                      -- ^ Units allocated
+        receiverKycId    : ContractId ParticipantKYC
+        receiverProfileId : ContractId InvestorProfile
+      controller lender
+      do
+        assertMsg "MintAllocation: allocation must be positive"
+          (allocationAmount > 0.0)
+        assertMsg "MintAllocation: allocation exceeds tranche size"
+          (allocationAmount <= tranche.totalTokens)
+        -- KYC gate.
+        kycRecord <- fetch receiverKycId
+        assertMsg "MintAllocation: KYC must be for this investor"
+          (kycRecord.participant == investor)
+        assertMsg "MintAllocation: investor must be KYCApproved"
+          (kycRecord.kycStatus == KYCApproved)
+        -- Investor profile gate.
+        profile <- fetch receiverProfileId
+        assertMsg "MintAllocation: profile must be for this investor"
+          (profile.investor == investor)
+        assertMsg "MintAllocation: investor profile must be active"
+          profile.isActive
+        -- Mint.
+        create IssuedToken with
+          operator    = operator
+          lender      = lender
+          investor    = investor
+          loanId      = loanId
+          tokenId     = tokenId
+          tranche     = tranche
+          tokenAmount = allocationAmount
+          issuedOn    = issuedOn
+          status      = TokenActive
+
+    -- | Close the issuance record once all allocations are minted.
+    choice CloseIssuance : ()
+      controller lender
+      do return ()

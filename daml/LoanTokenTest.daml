@@ -1,0 +1,560 @@
+-- | Daml Script tests for the LoanToken module.
+-- Covers: TokenIssuance + MintAllocation, full transfer (partial and full),
+-- compliance gate (KYC, profile), freeze/unfreeze lifecycle, yield accrual,
+-- redemption, ensure violations, authorization guards, and state guards.
+module LoanTokenTest where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import DA.Optional (None, Some)
+import Types
+import Compliance
+import CollateralRegistry
+import LoanOrigination
+import InvestorRegistry
+import LoanToken
+
+-- ---------------------------------------------------------------------------
+-- Test fixture
+-- ---------------------------------------------------------------------------
+
+data TokenFixture = TokenFixture
+  with
+    operator  : Party
+    lender    : Party
+    borrower  : Party
+    alice     : Party   -- primary investor
+    bob       : Party   -- secondary investor (transfer receiver)
+    mallory   : Party   -- unauthorized third party
+
+setupFixture : Script TokenFixture
+setupFixture = do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "Operator")
+  lender   <- allocatePartyWithHint "Lender"   (PartyIdHint "Lender")
+  borrower <- allocatePartyWithHint "Borrower" (PartyIdHint "Borrower")
+  alice    <- allocatePartyWithHint "Alice"    (PartyIdHint "Alice")
+  bob      <- allocatePartyWithHint "Bob"      (PartyIdHint "Bob")
+  mallory  <- allocatePartyWithHint "Mallory"  (PartyIdHint "Mallory")
+  return TokenFixture with ..
+
+-- | Standard token tranche: 1,000,000 units × $1 face value, 3% yield.
+standardTranche : TokenTranche
+standardTranche = TokenTranche with
+  totalTokens    = 1_000_000.0
+  tokenFaceValue = 1.0          -- $1 per token
+  investorYield  = 0.03         -- 3% p.a.
+
+-- ---------------------------------------------------------------------------
+-- Shared helpers
+-- ---------------------------------------------------------------------------
+
+-- | Approve KYC for a given party.
+approveKYC : Party -> Party -> Script (ContractId ParticipantKYC)
+approveKYC operator participant = do
+  cid <- submit operator do
+    createCmd ParticipantKYC with
+      operator        = operator
+      participant     = participant
+      participantName = "Participant"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 1
+      jurisdiction    = "US"
+  submit operator do exerciseCmd cid ApproveKYC
+
+-- | Create an active InvestorProfile with a $1M cap.
+mkInvestorProfile : Party -> Party -> ContractId InvestorAccreditation -> Script (ContractId InvestorProfile)
+mkInvestorProfile operator investor accredCid = do
+  reqCid <- submit investor do
+    createCmd OnboardingRequest with
+      operator     = operator
+      investor     = investor
+      investorName = "Investor"
+      tier         = Entity506c
+      requestedMax = 1_000_000.0
+      submittedOn  = date 2026 Jan 1
+  submit operator do
+    exerciseCmd reqCid ApproveOnboarding with
+      accreditationCid = accredCid
+      approvedMax      = 1_000_000.0
+
+-- | Full compliance setup for an investor: KYC + accreditation + profile.
+onboardInvestor : Party -> Party -> Script (ContractId ParticipantKYC, ContractId InvestorProfile)
+onboardInvestor operator investor = do
+  kycCid <- approveKYC operator investor
+  accredCid <- submit operator do
+    createCmd InvestorAccreditation with
+      operator        = operator
+      investor        = investor
+      investorName    = "Investor"
+      tier            = Entity506c
+      attestationDate = date 2026 Jan 1
+      expiryDate      = date 2027 Jan 1
+  profileCid <- mkInvestorProfile operator investor accredCid
+  return (kycCid, profileCid)
+
+-- | Fund an ActiveLoan (collateral + KYC + application → funded).
+fundTestLoan : TokenFixture -> Script (ContractId ActiveLoan)
+fundTestLoan f = do
+  colCid <- submit f.operator do
+    createCmd CollateralAsset with
+      operator  = f.operator
+      lender    = f.lender
+      borrower  = f.borrower
+      assetInfo = CollateralInfo with
+        assetId        = "ASSET-RE-001"
+        assetType      = RealEstate
+        description    = "Test warehouse"
+        location       = "Chicago, IL"
+        appraisedValue = 2_000_000.0
+        appraisalDate  = date 2026 Jan 1
+      status    = AssetRegistered
+      loanId    = None
+  borrowerKycCid <- approveKYC f.operator f.borrower
+  appCid <- submit f.borrower do
+    createCmd LoanApplication with
+      operator          = f.operator
+      lender            = f.lender
+      borrower          = f.borrower
+      loanId            = "ABL-2026-0001"
+      requestedAmount   = 1_000_000.0
+      collateralAssetId = "ASSET-RE-001"
+      submittedOn       = date 2026 Jan 1
+  commCid <- submit f.lender do
+    exerciseCmd appCid IssueCommitment with
+      terms = LoanTerms with
+        principal          = 1_000_000.0
+        annualInterestRate = 0.08
+        originationDate    = date 2026 Jan 1
+        maturityDate       = date 2027 Jan 1
+        paymentFrequency   = Monthly
+        maxLTV             = 0.75
+      issuedOn = date 2026 Jan 1
+  (activeCid, _) <- submit f.borrower do
+    exerciseCmd commCid AcceptCommitment with
+      collateralCid = colCid
+      borrowerKycId = borrowerKycCid
+  return activeCid
+
+-- | Create a TokenIssuance record.
+mkIssuance : TokenFixture -> ContractId ActiveLoan -> Script (ContractId TokenIssuance)
+mkIssuance f loanCid = submit f.lender do
+  createCmd TokenIssuance with
+    operator = f.operator
+    lender   = f.lender
+    loanId   = "ABL-2026-0001"
+    tokenId  = "TKN-0001-A"
+    tranche  = standardTranche
+    issuedOn = date 2026 Jan 1
+    loanCid  = loanCid
+
+-- | Onboard Alice and mint her a full-tranche token.
+mintAliceToken : TokenFixture
+             -> ContractId TokenIssuance
+             -> Script (ContractId IssuedToken, ContractId ParticipantKYC, ContractId InvestorProfile)
+mintAliceToken f issuanceCid = do
+  (kycCid, profileCid) <- onboardInvestor f.operator f.alice
+  tokenCid <- submit f.lender do
+    exerciseCmd issuanceCid MintAllocation with
+      investor          = f.alice
+      allocationAmount  = 1_000_000.0
+      receiverKycId     = kycCid
+      receiverProfileId = profileCid
+  return (tokenCid, kycCid, profileCid)
+
+-- ---------------------------------------------------------------------------
+-- TokenIssuance + MintAllocation
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: create issuance → mint allocation → close.
+issuanceAndMintTest : Script ()
+issuanceAndMintTest = script do
+  f         <- setupFixture
+  loanCid   <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+  -- Close the issuance record.
+  submit f.lender do exerciseCmd issuanceCid CloseIssuance
+
+-- | MintAllocation: KYC must be KYCApproved (not Pending).
+mintWithPendingKYCTest : Script ()
+mintWithPendingKYCTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  -- Create KYC but do NOT approve it.
+  pendingKycCid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.alice
+      participantName = "Alice"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 1
+      jurisdiction    = "US"
+  accredCid <- submit f.operator do
+    createCmd InvestorAccreditation with
+      operator        = f.operator
+      investor        = f.alice
+      investorName    = "Alice"
+      tier            = Entity506c
+      attestationDate = date 2026 Jan 1
+      expiryDate      = date 2027 Jan 1
+  profileCid <- mkInvestorProfile f.operator f.alice accredCid
+  submitMustFail f.lender do
+    exerciseCmd issuanceCid MintAllocation with
+      investor          = f.alice
+      allocationAmount  = 500_000.0
+      receiverKycId     = pendingKycCid
+      receiverProfileId = profileCid
+
+-- | MintAllocation: KYC must belong to the named investor.
+mintWithWrongKYCTest : Script ()
+mintWithWrongKYCTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  -- Onboard Bob but try to mint to Alice using Bob's KYC.
+  (bobKycCid, _)    <- onboardInvestor f.operator f.bob
+  (_, aliceProfile) <- onboardInvestor f.operator f.alice
+  submitMustFail f.lender do
+    exerciseCmd issuanceCid MintAllocation with
+      investor          = f.alice
+      allocationAmount  = 500_000.0
+      receiverKycId     = bobKycCid   -- wrong owner
+      receiverProfileId = aliceProfile
+
+-- | ensure on TokenIssuance: investor yield must be a valid rate.
+issuanceInvalidYieldTest : Script ()
+issuanceInvalidYieldTest = script do
+  f       <- setupFixture
+  loanCid <- fundTestLoan f
+  submitMustFail f.lender do
+    createCmd TokenIssuance with
+      operator = f.operator
+      lender   = f.lender
+      loanId   = "ABL-2026-0001"
+      tokenId  = "TKN-0001-A"
+      tranche  = standardTranche with investorYield = 1.5  -- > 1.0; invalid
+      issuedOn = date 2026 Jan 1
+      loanCid  = loanCid
+
+-- ---------------------------------------------------------------------------
+-- Transfer
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: full transfer to a new investor.
+fullTransferTest : Script ()
+fullTransferTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+
+  (receiverCid, residual) <- submit f.lender do
+    exerciseCmd tokenCid Transfer with
+      newInvestor       = f.bob
+      transferAmount    = 1_000_000.0
+      receiverKycId     = bobKycCid
+      receiverProfileId = bobProfileCid
+
+  assertMsg "full transfer should leave no residual" (residual == None)
+
+-- | Happy path: partial transfer — residual stays with original holder.
+partialTransferTest : Script ()
+partialTransferTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+
+  (receiverCid, residual) <- submit f.lender do
+    exerciseCmd tokenCid Transfer with
+      newInvestor       = f.bob
+      transferAmount    = 400_000.0
+      receiverKycId     = bobKycCid
+      receiverProfileId = bobProfileCid
+
+  case residual of
+    None    -> assertFail "partial transfer should leave a residual for Alice"
+    Some _  -> return ()
+
+-- | Transfer: receiver KYC must be KYCApproved.
+transferPendingKYCTest : Script ()
+transferPendingKYCTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+  pendingKycCid <- submit f.operator do
+    createCmd ParticipantKYC with
+      operator        = f.operator
+      participant     = f.bob
+      participantName = "Bob"
+      kycStatus       = KYCPending
+      submittedOn     = date 2026 Jan 1
+      jurisdiction    = "US"
+  (_, bobProfileCid) <- onboardInvestor f.operator f.bob
+  submitMustFail f.lender do
+    exerciseCmd tokenCid Transfer with
+      newInvestor       = f.bob
+      transferAmount    = 100_000.0
+      receiverKycId     = pendingKycCid
+      receiverProfileId = bobProfileCid
+
+-- | Transfer: receiver investor profile must be active.
+transferInactiveProfileTest : Script ()
+transferInactiveProfileTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+  -- Deactivate Bob's profile.
+  deactivatedProfileCid <- submit f.operator do
+    exerciseCmd bobProfileCid DeactivateProfile
+  submitMustFail f.lender do
+    exerciseCmd tokenCid Transfer with
+      newInvestor       = f.bob
+      transferAmount    = 100_000.0
+      receiverKycId     = bobKycCid
+      receiverProfileId = deactivatedProfileCid
+
+-- | Transfer: cannot transfer more than held amount.
+overdraftTransferTest : Script ()
+overdraftTransferTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid  -- 1,000,000 units
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+  submitMustFail f.lender do
+    exerciseCmd tokenCid Transfer with
+      newInvestor       = f.bob
+      transferAmount    = 2_000_000.0   -- more than held
+      receiverKycId     = bobKycCid
+      receiverProfileId = bobProfileCid
+
+-- | Transfer: amount must be positive.
+zeroTransferTest : Script ()
+zeroTransferTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+  submitMustFail f.lender do
+    exerciseCmd tokenCid Transfer with
+      newInvestor       = f.bob
+      transferAmount    = 0.0
+      receiverKycId     = bobKycCid
+      receiverProfileId = bobProfileCid
+
+-- | Transfer: frozen token cannot be transferred.
+transferFrozenTokenTest : Script ()
+transferFrozenTokenTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+  frozenCid <- submit f.lender do exerciseCmd tokenCid FreezeToken
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+  submitMustFail f.lender do
+    exerciseCmd frozenCid Transfer with
+      newInvestor       = f.bob
+      transferAmount    = 100_000.0
+      receiverKycId     = bobKycCid
+      receiverProfileId = bobProfileCid
+
+-- | Only the lender (transfer agent) can initiate a transfer.
+unauthorizedTransferTest : Script ()
+unauthorizedTransferTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+  (bobKycCid, bobProfileCid) <- onboardInvestor f.operator f.bob
+  -- Alice tries to transfer her own tokens without going through the lender.
+  submitMustFail f.alice do
+    exerciseCmd tokenCid Transfer with
+      newInvestor       = f.bob
+      transferAmount    = 100_000.0
+      receiverKycId     = bobKycCid
+      receiverProfileId = bobProfileCid
+
+-- ---------------------------------------------------------------------------
+-- Freeze / Unfreeze
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: Active → Frozen → Active.
+freezeUnfreezeTest : Script ()
+freezeUnfreezeTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+
+  frozenCid   <- submit f.lender do exerciseCmd tokenCid  FreezeToken
+  activeCid   <- submit f.lender do exerciseCmd frozenCid UnfreezeToken
+  -- Token is active again — yield accrual should work.
+  _ <- submit f.lender do
+    exerciseCmd activeCid AccrueYield with
+      fromDate = date 2026 Jan 1
+      toDate   = date 2026 Feb 1
+  return ()
+
+-- | Cannot freeze an already-frozen token.
+doubleFreezeTest : Script ()
+doubleFreezeTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+  frozenCid <- submit f.lender do exerciseCmd tokenCid FreezeToken
+  submitMustFail f.lender do exerciseCmd frozenCid FreezeToken
+
+-- | Cannot unfreeze an active token.
+unfreezeActiveTest : Script ()
+unfreezeActiveTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+  submitMustFail f.lender do exerciseCmd tokenCid UnfreezeToken
+
+-- ---------------------------------------------------------------------------
+-- Yield accrual (nonconsuming)
+-- ---------------------------------------------------------------------------
+
+-- | Yield for 1M units × $1 face × 3% × 30 days ≈ $2,465.75.
+yieldAccrualTest : Script ()
+yieldAccrualTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+
+  yield <- submit f.lender do
+    exerciseCmd tokenCid AccrueYield with
+      fromDate = date 2026 Jan 1
+      toDate   = date 2026 Jan 31  -- 30 days
+
+  let expected = 1_000_000.0 * 0.03 * (30.0 / 365.0)
+  assertMsg
+    ("yield mismatch: expected " <> show expected <> ", got " <> show yield)
+    (yield == expected)
+
+-- | Zero-day period yields zero.
+zeroDayYieldTest : Script ()
+zeroDayYieldTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+
+  yield <- submit f.lender do
+    exerciseCmd tokenCid AccrueYield with
+      fromDate = date 2026 Jan 1
+      toDate   = date 2026 Jan 1  -- same day → 0 days
+
+  assertMsg "zero-day accrual should be 0.0" (yield == 0.0)
+
+-- | Multiple AccrueYield calls do not consume the token.
+yieldNonConsumingTest : Script ()
+yieldNonConsumingTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+
+  _ <- submit f.lender do exerciseCmd tokenCid AccrueYield with fromDate = date 2026 Jan 1; toDate = date 2026 Feb 1
+  _ <- submit f.lender do exerciseCmd tokenCid AccrueYield with fromDate = date 2026 Feb 1; toDate = date 2026 Mar 1
+  -- Token still alive — freeze should still work.
+  _ <- submit f.lender do exerciseCmd tokenCid FreezeToken
+  return ()
+
+-- ---------------------------------------------------------------------------
+-- Redemption
+-- ---------------------------------------------------------------------------
+
+-- | Happy path: redeem returns correct USD proceeds.
+redemptionTest : Script ()
+redemptionTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+
+  proceeds <- submit f.lender do
+    exerciseCmd tokenCid RedeemToken with
+      redemptionDate = date 2027 Jan 1  -- maturity
+
+  -- 1M units / 1M total × $1 face × 1M total = $1,000,000
+  assertMsg
+    ("expected $1M proceeds, got " <> show proceeds)
+    (proceeds == 1_000_000.0)
+
+-- | Partial holder redeeming their pro-rata share.
+partialRedemptionTest : Script ()
+partialRedemptionTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+
+  -- Mint only 250k units for Alice (25% of 1M tranche).
+  (aliceKycCid, aliceProfileCid) <- onboardInvestor f.operator f.alice
+  tokenCid <- submit f.lender do
+    exerciseCmd issuanceCid MintAllocation with
+      investor          = f.alice
+      allocationAmount  = 250_000.0
+      receiverKycId     = aliceKycCid
+      receiverProfileId = aliceProfileCid
+
+  proceeds <- submit f.lender do
+    exerciseCmd tokenCid RedeemToken with redemptionDate = date 2027 Jan 1
+
+  -- 250k / 1M = 25%; 25% × $1 × 1M = $250,000
+  assertMsg ("expected $250k proceeds, got " <> show proceeds) (proceeds == 250_000.0)
+
+-- | Frozen token cannot be redeemed.
+redeemFrozenTest : Script ()
+redeemFrozenTest = script do
+  f <- setupFixture
+  loanCid     <- fundTestLoan f
+  issuanceCid <- mkIssuance f loanCid
+  (tokenCid, _, _) <- mintAliceToken f issuanceCid
+  frozenCid <- submit f.lender do exerciseCmd tokenCid FreezeToken
+  submitMustFail f.lender do
+    exerciseCmd frozenCid RedeemToken with redemptionDate = date 2027 Jan 1
+
+-- | ensure: token amount must be positive.
+zeroTokenAmountTest : Script ()
+zeroTokenAmountTest = script do
+  f <- setupFixture
+  submitMustFail f.lender do
+    createCmd IssuedToken with
+      operator    = f.operator
+      lender      = f.lender
+      investor    = f.alice
+      loanId      = "ABL-2026-0001"
+      tokenId     = "TKN-0001-A"
+      tranche     = standardTranche
+      tokenAmount = 0.0           -- violates ensure
+      issuedOn    = date 2026 Jan 1
+      status      = TokenActive
+
+-- | ensure: cannot create a token in Redeemed status.
+redeemedStatusAtCreationTest : Script ()
+redeemedStatusAtCreationTest = script do
+  f <- setupFixture
+  submitMustFail f.lender do
+    createCmd IssuedToken with
+      operator    = f.operator
+      lender      = f.lender
+      investor    = f.alice
+      loanId      = "ABL-2026-0001"
+      tokenId     = "TKN-0001-A"
+      tranche     = standardTranche
+      tokenAmount = 100_000.0
+      issuedOn    = date 2026 Jan 1
+      status      = TokenRedeemed  -- violates ensure
