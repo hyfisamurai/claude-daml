@@ -1,3 +1,208 @@
--- | Shared types and utility functions used across all modules.
--- This module has no dependencies on other project modules.
+-- | Shared types and pure utility functions used across all modules.
+-- This module has NO dependencies on other project modules.
+--
+-- Dependency order: Types ← everything else
 module Types where
+
+import DA.Date (diffDays)
+
+-- ---------------------------------------------------------------------------
+-- Party role type aliases
+-- Semantic clarity — the underlying runtime type is still Party.
+-- ---------------------------------------------------------------------------
+
+-- | The FinTech ABL originator, servicer, and token issuer.
+type Lender    = Party
+
+-- | The business pledging hard assets as collateral for an ABL loan.
+type Borrower  = Party
+
+-- | Certified third-party asset appraiser.
+type Appraiser = Party
+
+-- | System administrator: manages compliance registry, onboards parties.
+type Operator  = Party
+
+-- | Accredited investor purchasing fractional loan tokens on the secondary market.
+type Investor  = Party
+
+-- ---------------------------------------------------------------------------
+-- Identifier type aliases
+-- All IDs are Text so they can carry human-readable references
+-- (e.g., "ABL-2026-0001", "TKN-0001-A").
+-- ---------------------------------------------------------------------------
+
+-- | Unique loan reference, e.g. "ABL-2026-0001".
+type LoanId     = Text
+
+-- | Unique token tranche identifier, e.g. "TKN-0001-A".
+type TokenId    = Text
+
+-- | Unique collateral asset identifier, e.g. "ASSET-RE-001".
+type AssetId    = Text
+
+-- | Unique secondary market trade identifier, e.g. "TRADE-20260302-001".
+type TradeId    = Text
+
+-- ---------------------------------------------------------------------------
+-- Collateral asset classification
+-- ---------------------------------------------------------------------------
+
+-- | Physical asset categories accepted as ABL collateral.
+data CollateralAssetType
+  = RealEstate    -- ^ Commercial or industrial real property
+  | Equipment     -- ^ Manufacturing, processing, or medical equipment
+  | Fleet         -- ^ Vehicles, trucks, or heavy machinery
+  | Agricultural  -- ^ Farm land, livestock, or crop inventory
+  | Inventory     -- ^ Raw materials or finished goods
+  | OtherAsset    -- ^ Regulator-approved non-standard collateral
+  deriving (Eq, Ord, Show)
+
+-- | Lifecycle status of a registered collateral asset.
+data AssetStatus
+  = AssetRegistered   -- ^ On-chain record created; awaiting lien perfection
+  | AssetEncumbered   -- ^ Senior secured lien perfected by the lender
+  | AssetReleased     -- ^ Lien released upon full loan repayment
+  | AssetLiquidated   -- ^ Asset sold by lender to recover outstanding balance
+  deriving (Eq, Ord, Show)
+
+-- ---------------------------------------------------------------------------
+-- Loan lifecycle status
+-- ---------------------------------------------------------------------------
+
+-- | Lifecycle state of an ABL loan.
+data LoanStatus
+  = LoanPending    -- ^ Application submitted; under underwriting review
+  | LoanCommitted  -- ^ Term sheet issued and accepted by borrower
+  | LoanActive     -- ^ Fully funded; capital deployed, in active servicing
+  | LoanDefaulted  -- ^ Covenant breach or missed payment; default declared
+  | LoanRepaid     -- ^ Principal fully returned; pending lien release
+  deriving (Eq, Ord, Show)
+
+-- | Frequency at which the borrower makes interest + principal payments.
+data PaymentFrequency
+  = Monthly
+  | Quarterly
+  | SemiAnnual
+  | Annual
+  deriving (Eq, Ord, Show)
+
+-- ---------------------------------------------------------------------------
+-- Compliance and regulatory status
+-- ---------------------------------------------------------------------------
+
+-- | KYC/AML clearance status for any participant (borrower, investor, etc.).
+data KYCStatus
+  = KYCPending    -- ^ Submitted; awaiting operator review
+  | KYCApproved   -- ^ Cleared for participation on the platform
+  | KYCSuspended  -- ^ Temporarily frozen (e.g., suspicious activity review)
+  | KYCRevoked    -- ^ Permanently barred (e.g., sanctions match)
+  deriving (Eq, Ord, Show)
+
+-- | Reg D 506(c) accreditation tier of an investor.
+data AccreditationTier
+  = Individual506c
+    -- ^ Individual with net worth > $1M (excl. primary residence)
+    --   or 2-year income > $200k (single) / $300k (joint).
+  | Entity506c
+    -- ^ Entity with total assets > $5M, not formed solely to acquire securities.
+  | QualifiedPurchaser
+    -- ^ Institution or individual with $5M+ in qualifying investments.
+  deriving (Eq, Ord, Show)
+
+-- ---------------------------------------------------------------------------
+-- Token and secondary market status
+-- ---------------------------------------------------------------------------
+
+-- | Lifecycle state of a fractional loan token.
+data TokenStatus
+  = TokenActive    -- ^ Held by an investor; yield-bearing
+  | TokenFrozen    -- ^ Compliance hold; transfers blocked
+  | TokenRedeemed  -- ^ Principal returned at maturity; token retired
+  deriving (Eq, Ord, Show)
+
+-- | Status of a secondary market token listing.
+data ListingStatus
+  = ListingOpen       -- ^ Available for purchase
+  | ListingMatched    -- ^ Matched with a buyer; DVP settlement pending
+  | ListingSettled    -- ^ Atomic DVP complete; ownership transferred
+  | ListingCancelled  -- ^ Seller withdrew before a match
+  | ListingExpired    -- ^ Passed expiry date without a match
+  deriving (Eq, Ord, Show)
+
+-- ---------------------------------------------------------------------------
+-- Reusable composite record types
+-- ---------------------------------------------------------------------------
+
+-- | Core economic terms of an ABL loan.
+data LoanTerms = LoanTerms
+  with
+    principal          : Decimal        -- ^ Loan face value in USD
+    annualInterestRate : Decimal        -- ^ Borrower rate, e.g. 0.10 for 10% p.a.
+    originationDate    : Date           -- ^ Date capital is disbursed
+    maturityDate       : Date           -- ^ Scheduled full-repayment date
+    paymentFrequency   : PaymentFrequency
+    maxLTV             : Decimal        -- ^ LTV covenant ceiling, e.g. 0.75
+  deriving (Eq, Show)
+
+-- | Immutable snapshot of a collateral asset's key attributes at registration.
+data CollateralInfo = CollateralInfo
+  with
+    assetId        : AssetId
+    assetType      : CollateralAssetType
+    description    : Text               -- ^ Plain-language asset description
+    location       : Text               -- ^ Street address or GPS reference
+    appraisedValue : Decimal            -- ^ USD appraised value
+    appraisalDate  : Date               -- ^ Date of most recent appraisal
+  deriving (Eq, Show)
+
+-- | Economics of a token tranche minted against a funded loan.
+data TokenTranche = TokenTranche
+  with
+    totalTokens    : Decimal  -- ^ Total units minted, e.g. 1_000_000
+    tokenFaceValue : Decimal  -- ^ USD value per token at issuance
+    investorYield  : Decimal  -- ^ Annual yield passed to investors, e.g. 0.03
+  deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- Pure utility functions
+-- ---------------------------------------------------------------------------
+
+-- | Compute simple interest accrued over `days` at an annual rate.
+--
+-- Formula: principal × annualRate × (days / 365)
+--
+-- Example: calculateDailyInterest 1_000_000.0 0.03 30
+--          = 2_465.75  (approx $2,466 yield on $1M over 30 days at 3%)
+calculateDailyInterest : Decimal -> Decimal -> Int -> Decimal
+calculateDailyInterest principal annualRate days =
+  principal * annualRate * (intToDecimal days / 365.0)
+
+-- | Compute the current loan-to-value ratio.
+--
+-- Returns 1.0 (100% LTV) when appraisedValue is zero to signal maximum risk.
+computeLTV : Decimal -> Decimal -> Decimal
+computeLTV outstandingBalance appraisedValue
+  | appraisedValue == 0.0 = 1.0
+  | otherwise             = outstandingBalance / appraisedValue
+
+-- | True when a rate is a valid proportion (0.0 ≤ r ≤ 1.0).
+isValidRate : Decimal -> Bool
+isValidRate r = r >= 0.0 && r <= 1.0
+
+-- | True when an LTV is within meaningful bounds (0.0 < ltv ≤ 1.0).
+isValidLTV : Decimal -> Bool
+isValidLTV ltv = ltv > 0.0 && ltv <= 1.0
+
+-- | Number of calendar days from origination to maturity.
+loanDurationDays : Date -> Date -> Int
+loanDurationDays originationDate maturityDate =
+  diffDays maturityDate originationDate
+
+-- | Pro-rata token share: what fraction of the tranche does `tokenCount` represent?
+--
+-- Returns 0.0 if totalTokens is zero (guard against division by zero).
+proRataShare : Decimal -> Decimal -> Decimal
+proRataShare tokenCount totalTokens
+  | totalTokens == 0.0 = 0.0
+  | otherwise          = tokenCount / totalTokens

@@ -1,0 +1,107 @@
+-- | Smoke tests for pure utility functions defined in Types.
+-- No templates — just validates the math and guard logic.
+module TypesTest where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import Types
+
+-- ---------------------------------------------------------------------------
+-- Test: calculateDailyInterest
+-- ---------------------------------------------------------------------------
+
+-- | $1M principal, 3% annual yield, 30 days ≈ $2,465.75
+interestCalcTest : Script ()
+interestCalcTest = script do
+  let result   = calculateDailyInterest 1_000_000.0 0.03 30
+      expected = 1_000_000.0 * 0.03 * (30.0 / 365.0)
+  assertMsg
+    ("calculateDailyInterest mismatch: got " <> show result)
+    (result == expected)
+
+-- | Zero principal always yields zero interest.
+zeroInterestTest : Script ()
+zeroInterestTest = script do
+  let result = calculateDailyInterest 0.0 0.10 365
+  assertMsg "zero principal should yield zero interest" (result == 0.0)
+
+-- ---------------------------------------------------------------------------
+-- Test: computeLTV
+-- ---------------------------------------------------------------------------
+
+-- | Standard LTV: $650k outstanding on $1M collateral = 65%.
+ltvCalcTest : Script ()
+ltvCalcTest = script do
+  let result = computeLTV 650_000.0 1_000_000.0
+  assertMsg
+    ("computeLTV mismatch: got " <> show result)
+    (result == 0.65)
+
+-- | Zero collateral value must return 1.0 (100% LTV / max risk).
+zeroCollateralLTVTest : Script ()
+zeroCollateralLTVTest = script do
+  let result = computeLTV 500_000.0 0.0
+  assertMsg "zero collateral should return 1.0 LTV" (result == 1.0)
+
+-- ---------------------------------------------------------------------------
+-- Test: isValidRate
+-- ---------------------------------------------------------------------------
+
+validRateTest : Script ()
+validRateTest = script do
+  assertMsg "0.0 is a valid rate"  (isValidRate 0.0)
+  assertMsg "0.10 is a valid rate" (isValidRate 0.10)
+  assertMsg "1.0 is a valid rate"  (isValidRate 1.0)
+  assertMsg "-0.01 is invalid"     (not (isValidRate (-0.01)))
+  assertMsg "1.01 is invalid"      (not (isValidRate 1.01))
+
+-- ---------------------------------------------------------------------------
+-- Test: isValidLTV
+-- ---------------------------------------------------------------------------
+
+validLTVTest : Script ()
+validLTVTest = script do
+  assertMsg "0.75 is a valid LTV"  (isValidLTV 0.75)
+  assertMsg "1.0 is a valid LTV"   (isValidLTV 1.0)
+  assertMsg "0.0 is invalid LTV"   (not (isValidLTV 0.0))
+  assertMsg "-0.1 is invalid LTV"  (not (isValidLTV (-0.1)))
+  assertMsg "1.01 is invalid LTV"  (not (isValidLTV 1.01))
+
+-- ---------------------------------------------------------------------------
+-- Test: loanDurationDays
+-- ---------------------------------------------------------------------------
+
+-- | A 12-month loan from Jan 1 to Dec 31 2026 = 364 days.
+loanDurationTest : Script ()
+loanDurationTest = script do
+  let start  = date 2026 Jan 1
+      end    = date 2026 Dec 31
+      result = loanDurationDays start end
+  assertMsg
+    ("loanDurationDays: expected 364, got " <> show result)
+    (result == 364)
+
+-- | Origination and maturity on same day = 0 days.
+zeroDurationTest : Script ()
+zeroDurationTest = script do
+  let d      = date 2026 Jan 1
+      result = loanDurationDays d d
+  assertMsg "same-day duration should be 0" (result == 0)
+
+-- ---------------------------------------------------------------------------
+-- Test: proRataShare
+-- ---------------------------------------------------------------------------
+
+proRataTest : Script ()
+proRataTest = script do
+  -- Investor holds 250k of 1M tokens = 25%
+  let result = proRataShare 250_000.0 1_000_000.0
+  assertMsg
+    ("proRataShare: expected 0.25, got " <> show result)
+    (result == 0.25)
+
+-- | Zero total tokens returns 0.0 (no division by zero).
+zeroDenominatorProRataTest : Script ()
+zeroDenominatorProRataTest = script do
+  let result = proRataShare 100.0 0.0
+  assertMsg "zero total tokens should return 0.0" (result == 0.0)
